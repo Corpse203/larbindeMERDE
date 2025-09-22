@@ -1,0 +1,24 @@
+
+services:
+  - type: web
+    name: mrlarbin-dlive
+    env: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: DLIVE_CLIENT_ID
+        sync: false
+      - key: DLIVE_CLIENT_SECRET
+        sync: false
+      - key: DLIVE_REDIRECT_URI
+        value: https://mrlarbin-dlive.onrender.com/oauth/callback
+      - key: DLIVE_TARGET_DISPLAYNAME
+        value: skrymi
+      - key: DLIVE_MESSAGE
+        value: "Bjr de MrLarbin 👋"
+      - key: PORT
+        value: "10000"
+    healthCheckPath: /
+    autoDeploy: true
