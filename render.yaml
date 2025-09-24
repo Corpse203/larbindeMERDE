@@ -1,7 +1,6 @@
-
 services:
   - type: web
-    name: mrlarbin-dlive
+    name: mrlarbin-dlive-apptoken
     env: node
     plan: free
     region: frankfurt
@@ -12,12 +11,10 @@ services:
         sync: false
       - key: DLIVE_CLIENT_SECRET
         sync: false
-      - key: DLIVE_REDIRECT_URI
-        value: https://mrlarbin-dlive.onrender.com/oauth/callback
       - key: DLIVE_TARGET_DISPLAYNAME
         value: skrymi
       - key: DLIVE_MESSAGE
-        value: "Bjr de MrLarbin 👋"
+        value: "Hello depuis MrLarbin (app token)"
       - key: PORT
         value: "10000"
     healthCheckPath: /
