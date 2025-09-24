@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: mrlarbin-dlive-apptoken
+    name: mrlarbin-dlive-user
     env: node
     plan: free
     region: frankfurt
@@ -8,13 +8,15 @@ services:
     startCommand: npm start
     envVars:
       - key: DLIVE_CLIENT_ID
-        sync: false
+        value: "4196786727"
       - key: DLIVE_CLIENT_SECRET
-        sync: false
+        value: "Rqs1Ws1aLpMdnbD8wA0YzQfKBKiwe5AH"
+      - key: DLIVE_REDIRECT_URI
+        value: https://www.skrymi.com/oauth/callback
       - key: DLIVE_TARGET_DISPLAYNAME
         value: skrymi
       - key: DLIVE_MESSAGE
-        value: "Hello depuis MrLarbin (app token)"
+        value: "Hello depuis MrLarbin (user token)"
       - key: PORT
         value: "10000"
     healthCheckPath: /
