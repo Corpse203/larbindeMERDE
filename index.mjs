@@ -17,7 +17,7 @@ if (!DLIVE_CLIENT_ID || !DLIVE_CLIENT_SECRET) {
 const app = express();
 const GQL = 'https://graphigo.prd.dlive.tv/';
 
-// Cache en mémoire pour l'app access token
+// ====== Token d'app (client_credentials) ======
 let appToken = null;
 let appTokenExpiresAt = 0; // timestamp ms
 
@@ -43,8 +43,7 @@ async function getAppToken() {
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Token (client_credentials) failed: ${resp.status} ${text}`);
 
-  let json;
-  try { json = JSON.parse(text); } catch { throw new Error(`Token response not JSON: ${text}`); }
+  const json = JSON.parse(text);
   if (!json.access_token) throw new Error(`No access_token. Raw: ${text}`);
 
   appToken = json.access_token;
@@ -52,6 +51,21 @@ async function getAppToken() {
   appTokenExpiresAt = Date.now() + expiresIn * 1000;
   return appToken;
 }
+
+// ====== Helpers GraphQL + introspection ======
+function unwrap(t) {
+  // Récupère le "leaf" type (name/kind) en sautant NON_NULL/LIST/ofType...
+  let cur = t;
+  while (cur && !cur.name && cur.ofType) cur = cur.ofType;
+  return cur || t;
+}
+
+const TypeRef = `
+fragment TypeRef on __Type {
+  kind name
+  ofType { kind name ofType { kind name ofType { kind name } } }
+}
+`;
 
 async function gql(query, variables) {
   const token = await getAppToken();
@@ -69,21 +83,17 @@ async function gql(query, variables) {
   return data.data;
 }
 
-/** Introspection helpers **/
-const TypeRef = `
-fragment TypeRef on __Type {
-  kind name
-  ofType { kind name ofType { kind name ofType { kind name } } }
-}
-`;
-
 async function getMutationField(name) {
   const q = `
     ${TypeRef}
     query {
       __type(name: "Mutation") {
         name
-        fields { name args { name type { ...TypeRef } } type { ...TypeRef } }
+        fields {
+          name
+          args { name type { ...TypeRef } }
+          type { ...TypeRef }
+        }
       }
     }
   `;
@@ -91,13 +101,15 @@ async function getMutationField(name) {
   return (data.__type.fields || []).find(f => f.name === name);
 }
 
-async function getInputType(name) {
+async function getType(name) {
   const q = `
     ${TypeRef}
     query($name:String!) {
       __type(name: $name) {
-        name
+        kind name
         inputFields { name type { ...TypeRef } }
+        enumValues { name }
+        fields { name type { ...TypeRef } }
       }
     }
   `;
@@ -105,66 +117,102 @@ async function getInputType(name) {
   return data.__type;
 }
 
-/**
- * Envoi d’un message via sendStreamchatMessage(input: SendStreamchatMessageInput!)
- * On essaie d’abord de découvrir le/les champs attendus via introspection.
- * - champs possibles pour cibler la “room”: streamerName, streamer, channel, channelId, roomId
- * - message: "message" (si présent); sinon on essaie "content" comme fallback
- */
-async function sendChatMessageWithAppTokenAuto({ to, message }) {
-  // 1) introspect mutation + input
+// ====== Construction automatique de l'input ======
+async function buildSendStreamchatInput({ to, message }) {
+  // 1) Mutation + type d'input
   const mf = await getMutationField('sendStreamchatMessage');
-  if (!mf) throw new Error('Mutation sendStreamchatMessage introuvable dans le schéma');
+  if (!mf) throw new Error('Mutation sendStreamchatMessage introuvable');
 
-  const inputArg = (mf.args || []).find(a => a.name === 'input');
-  if (!inputArg) throw new Error('La mutation sendStreamchatMessage attend un argument "input"');
+  const argInput = (mf.args || []).find(a => a.name === 'input');
+  if (!argInput) throw new Error('Argument "input" manquant sur sendStreamchatMessage');
 
-  // Le nom de type d’input (ex: SendStreamchatMessageInput)
-  const inputTypeName =
-    inputArg.type?.name ||
-    inputArg.type?.ofType?.name ||
-    inputArg.type?.ofType?.ofType?.name;
+  const inputTypeLeaf = unwrap(argInput.type); // INPUT_OBJECT SendStreamchatMessageInput
+  const inputType = await getType(inputTypeLeaf.name);
+  const fields = inputType?.inputFields || [];
+  const fieldNames = fields.map(f => f.name);
 
-  if (!inputTypeName) throw new Error('Impossible de déterminer le type de l’argument input');
-
-  const inputType = await getInputType(inputTypeName);
-  const fields = (inputType?.inputFields || []).map(f => f.name);
-
-  // 2) construire l'input object en se basant sur ce que le schéma expose
-  const candidatesForTarget = ['streamerName', 'streamer', 'channel', 'channelId', 'roomId'];
-  const targetField = candidatesForTarget.find(k => fields.includes(k));
+  // 2) Choisir le champ "cible" (room/channel/streamer...)
+  const targetCandidates = ['roomId','channelId','streamer','streamerName','channel','roomName'];
+  const targetField = targetCandidates.find(n => fieldNames.includes(n));
   if (!targetField) {
-    throw new Error(
-      `Aucun champ cible connu trouvé dans ${inputTypeName}. Champs disponibles: ${fields.join(', ')}`
-    );
+    throw new Error(`Impossible d'identifier le champ cible (candidats: ${targetCandidates.join(', ')}). Champs dispo: ${fieldNames.join(', ')}`);
   }
 
-  let messageField = 'message';
-  if (!fields.includes('message')) {
-    if (fields.includes('content')) messageField = 'content';
-    else throw new Error(`Aucun champ message/content dans ${inputTypeName}. Champs: ${fields.join(', ')}`);
+  // 3) Choisir le champ "message" (message/content/text/body...)
+  const msgCandidates = ['message','content','text','body'];
+  const messageField = msgCandidates.find(n => fieldNames.includes(n));
+  if (!messageField) {
+    throw new Error(`Impossible d'identifier le champ message (candidats: ${msgCandidates.join(', ')}). Champs dispo: ${fieldNames.join(', ')}`);
   }
 
-  const input = { [targetField]: to, [messageField]: message };
+  // 4) roomRole si présent et requis → prendre une valeur ENUM valide
+  let roomRoleValue = null;
+  if (fieldNames.includes('roomRole')) {
+    const roomRoleField = fields.find(f => f.name === 'roomRole');
+    // type ENUM ?
+    const rrLeaf = unwrap(roomRoleField.type);
+    if (rrLeaf && rrLeaf.kind === 'ENUM') {
+      const enumType = await getType(rrLeaf.name);
+      const values = (enumType?.enumValues || []).map(v => v.name);
+      // on tente des valeurs "classiques" si présentes, sinon la première
+      const preferred = ['User','Viewer','Member','Normal','Guest'];
+      roomRoleValue = preferred.find(v => values.includes(v)) || values[0];
+      if (!roomRoleValue) {
+        throw new Error(`roomRole est requis mais aucune valeur ENUM trouvée pour ${rrLeaf.name}`);
+      }
+    } else {
+      // pas un enum ? on met une valeur neutre
+      roomRoleValue = 'User';
+    }
+  }
 
-  // 3) exécuter la mutation (sélection minimale fiable)
+  // 5) Construire l'input en remplissant les champs requis NON_NULL
+  const input = {};
+  for (const f of fields) {
+    const leaf = unwrap(f.type);
+    const isRequired = (f.type.kind === 'NON_NULL') || (f.type.ofType && f.type.kind === 'NON_NULL');
+    if (f.name === targetField) input[f.name] = to;
+    if (f.name === messageField) input[f.name] = message;
+    if (f.name === 'roomRole' && roomRoleValue) input[f.name] = roomRoleValue;
+
+    // si c'est requis et pas encore défini, on essaie d'assigner un défaut "raisonnable"
+    if (isRequired && input[f.name] === undefined) {
+      if (leaf.kind === 'SCALAR') {
+        // string/ID → valeur non vide ; int/bool → valeur neutre
+        if (leaf.name === 'String' || leaf.name === 'ID') input[f.name] = 'auto';
+        else if (leaf.name === 'Int') input[f.name] = 0;
+        else if (leaf.name === 'Boolean') input[f.name] = true;
+        else input[f.name] = 'auto';
+      } else if (leaf.kind === 'ENUM') {
+        const enumType = await getType(leaf.name);
+        const values = (enumType?.enumValues || []).map(v => v.name);
+        input[f.name] = values[0] || null;
+      } else {
+        // INPUT_OBJECT / LIST etc. → on ne met rien par défaut
+      }
+    }
+  }
+
+  return { input, inputTypeName: inputTypeLeaf.name, picked: { targetField, messageField, roomRoleValue } };
+}
+
+async function sendChatMessageWithAppTokenAuto({ to, message }) {
+  const { input, inputTypeName, picked } = await buildSendStreamchatInput({ to, message });
   const mutation = `
     mutation SendChat($input: ${inputTypeName}!) {
-      sendStreamchatMessage(input: $input) {
-        __typename
-      }
+      sendStreamchatMessage(input: $input) { __typename }
     }
   `;
   const data = await gql(mutation, { input });
-  return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
+  return { ok: true, inputUsed: input, picked, result: data.sendStreamchatMessage };
 }
 
-// ============== ROUTES ==============
+// ====== ROUTES ======
 
 // Healthcheck
-app.get('/', (_req, res) => res.status(200).send('OK - MrLarbin app-token mode (auto schema)'));
+app.get('/', (_req, res) => res.status(200).send('OK - MrLarbin app-token mode (auto schema + roomRole)'));
 
-// Test: obtenir un app token (sans login)
+// Token d’app
 app.get('/token/app', async (_req, res) => {
   try {
     const token = await getAppToken();
@@ -174,7 +222,7 @@ app.get('/token/app', async (_req, res) => {
   }
 });
 
-// Introspection brute : mutation sendStreamchatMessage
+// Introspection: mutation
 app.get('/schema/mutation', async (_req, res) => {
   try {
     const mf = await getMutationField('sendStreamchatMessage');
@@ -184,20 +232,19 @@ app.get('/schema/mutation', async (_req, res) => {
   }
 });
 
-// Introspection d’un type (ex: ?name=SendStreamchatMessageInput)
+// Introspection: type
 app.get('/schema/type', async (req, res) => {
   try {
     const name = req.query.name;
     if (!name) return res.status(400).send('query param ?name= requis');
-    const t = await getInputType(name.toString());
+    const t = await getType(name.toString());
     res.type('json').send(t);
   } catch (e) {
     res.status(500).send(e.message);
   }
 });
 
-// Envoi auto (déduit les champs via introspection)
-// /send-app?msg=Hello&to=skrymi
+// Envoi auto (choix des bons champs + roomRole)
 app.get('/send-app', async (req, res) => {
   try {
     const message = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
@@ -209,31 +256,31 @@ app.get('/send-app', async (req, res) => {
   }
 });
 
-// Envoi manuel si tu veux forcer le champ cible ou le champ message
-// /send-app-manual?to=skrymi&targetField=streamerName&msg=Hello&messageField=message
+// Envoi manuel (forcer le champ cible, messageField et roomRole)
+// /send-app-manual?to=skrymi&targetField=roomId&msg=Hello&messageField=message&roomRole=User
 app.get('/send-app-manual', async (req, res) => {
   try {
     const to = (req.query.to || DLIVE_TARGET_DISPLAYNAME).toString();
     const message = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
-    const targetField = (req.query.targetField || 'streamerName').toString();
+    const targetField = req.query.targetField?.toString();
     const messageField = (req.query.messageField || 'message').toString();
+    const forcedRoomRole = req.query.roomRole?.toString();
 
-    // Trouve le vrai nom de l'input
     const mf = await getMutationField('sendStreamchatMessage');
-    const inputArg = (mf.args || []).find(a => a.name === 'input');
-    const inputTypeName =
-      inputArg?.type?.name || inputArg?.type?.ofType?.name || inputArg?.type?.ofType?.ofType?.name;
+    const argInput = (mf.args || []).find(a => a.name === 'input');
+    const inputTypeLeaf = unwrap(argInput.type);
+    const inputTypeName = inputTypeLeaf.name;
 
-    if (!inputTypeName) throw new Error('Impossible de déterminer le type de l’argument input');
+    const input = {};
+    if (targetField) input[targetField] = to;
+    input[messageField] = message;
+    if (forcedRoomRole) input.roomRole = forcedRoomRole;
 
     const mutation = `
       mutation SendChat($input: ${inputTypeName}!) {
-        sendStreamchatMessage(input: $input) {
-          __typename
-        }
+        sendStreamchatMessage(input: $input) { __typename }
       }
     `;
-    const input = { [targetField]: to, [messageField]: message };
     const data = await gql(mutation, { input });
     res.status(200).send(`Message envoyé (manuel).<pre>${JSON.stringify({ input, result: data.sendStreamchatMessage }, null, 2)}</pre>`);
   } catch (e) {
@@ -242,5 +289,5 @@ app.get('/send-app-manual', async (req, res) => {
 });
 
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`MrLarbin app-token (auto schema) on http://0.0.0.0:${PORT}`);
+  console.log(`MrLarbin app-token (auto schema + roomRole) on http://0.0.0.0:${PORT}`);
 });
