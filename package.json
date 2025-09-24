@@ -1,6 +1,6 @@
 {
-  "name": "mrlarbin-dlive-chat-apptoken",
-  "version": "1.0.3",
+  "name": "mrlarbin-dlive-user-token",
+  "version": "1.0.0",
   "type": "module",
   "engines": { "node": ">=18" },
   "scripts": {
