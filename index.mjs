@@ -62,11 +62,10 @@ async function sendChatMessageWithAppToken({ streamer, message }) {
   const token = await getAppToken();
   const GQL = 'https://graphigo.prd.dlive.tv/';
 
-  // ⚠️ Le nom exact de la mutation peut varier selon le schéma.
-  // On commence avec sendChatMessage(streamer, message).
+  // ✅ DLive attend "sendStreamchatMessage" (erreur précédente conseillait ce nom)
   const mutation = `
     mutation SendChat($streamer: String!, $message: String!) {
-      sendChatMessage(streamer: $streamer, message: $message) {
+      sendStreamchatMessage(streamer: $streamer, message: $message) {
         id
         content
         createdAt
@@ -89,10 +88,12 @@ async function sendChatMessageWithAppToken({ streamer, message }) {
   const body = await resp.text();
   let data = {};
   try { data = JSON.parse(body); } catch {}
+
   if (!resp.ok || data.errors) {
     throw new Error(`GraphQL error: ${resp.status} ${body}`);
   }
-  return data.data.sendChatMessage;
+  // ✅ adapter l'accès au champ retourné
+  return data.data.sendStreamchatMessage;
 }
 
 // Healthcheck
@@ -117,7 +118,9 @@ app.get('/send-app', async (req, res) => {
     const to = (req.query.to || DLIVE_TARGET_DISPLAYNAME).toString();
     const streamer = to.toLowerCase();
     const result = await sendChatMessageWithAppToken({ streamer, message });
-    res.status(200).send(`Message envoyé à ${streamer} (app token).<pre>${JSON.stringify(result, null, 2)}</pre>`);
+    res
+      .status(200)
+      .send(`Message envoyé à ${streamer} (app token).<pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send(`Erreur envoi (app token): ${e.message}`);
   }
