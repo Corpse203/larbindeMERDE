@@ -1,10 +1,8 @@
 {
-  "name": "mrlarbin-dlive-chat",
+  "name": "mrlarbin-dlive-chat-apptoken",
   "version": "1.0.0",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "engines": { "node": ">=18" },
   "scripts": {
     "start": "node index.mjs",
     "build": "echo 'no build step'"
