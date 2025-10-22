@@ -1,3 +1,4 @@
+// index.mjs — DLive OAuth (redirect root) + envoi + commandes simples
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -5,10 +6,15 @@ import fetch from 'node-fetch';
 const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
-  DLIVE_REDIRECT_URI,                  // ⚠️ ex: https://skrymi.com
-  DLIVE_TARGET_USERNAME = 'skrymi',    // ⚠️ "username" (pas displayname)
+  DLIVE_REDIRECT_URI,                  // ex: https://skrymi.com (sans chemin)
+  DLIVE_TARGET_USERNAME = 'skrymi',    // ⚠️ username (pas displayname)
   DLIVE_MESSAGE = 'Hello depuis MrLarbin',
   PORT = 3000,
+
+  // liens pour commandes
+  DISCORD_URL = 'https://discord.gg/ton-invite',
+  YT_URL = 'https://youtube.com/@ton-chaine',
+  TWITTER_URL = 'https://twitter.com/toncompte',
 } = process.env;
 
 const app = express();
@@ -16,10 +22,10 @@ const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL = 'https://graphigo.prd.dlive.tv/';
 
-// ===== Tokens en mémoire (persiste en DB si besoin) =====
+// ===== Tokens en mémoire =====
 let userAccessToken = null;
 let userRefreshToken = null;
-let userTokenExpAt = 0; // timestamp ms
+let userTokenExpAt = 0; // ms
 
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
@@ -89,14 +95,13 @@ async function refreshUserTokenIfNeeded() {
 }
 
 // ========= Appel GraphQL =========
-// ⚠️ Très important: DLive attend l'Authorization = <ACCESS_TOKEN> (sans "Bearer ")
-// Réf. leurs docs et exemples cURL. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
+// ⚠️ DLive veut Authorization = <token> (SANS "Bearer ")
 async function gqlUser(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL, {
     method: 'POST',
     headers: {
-      'Authorization': token,              // <-- pas de "Bearer "
+      'Authorization': token,
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -113,31 +118,51 @@ async function gqlUser(query, variables) {
   return data.data;
 }
 
-// ========= Mutation d’envoi (selon leurs docs) =========
-// Input: streamer (username), message, roomRole (Member/Moderator/Owner), subscribing (Boolean)
+// ========= Envoi d’un message =========
 async function sendStreamchatMessage({ to, message, role = 'Member', subscribing = false }) {
   const mutation = `
     mutation SendMsg($input: SendStreamchatMessageInput!) {
       sendStreamchatMessage(input: $input) { message { __typename } err { code message } }
     }
   `;
-  // ⚠️ "streamer" = username (pas displayname). Docs l’indiquent. :contentReference[oaicite:4]{index=4}
   const input = { streamer: to, message, roomRole: role, subscribing };
   const data = await gqlUser(mutation, { input });
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
+// ========= Commandes =========
+function resolveCommand(cmdRaw = '') {
+  const cmd = cmdRaw.trim().toLowerCase();
+  switch (cmd) {
+    case '!discord':
+      return `Le discord est : ${DISCORD_URL}`;
+    case '!yt':
+    case '!youtube':
+      return `YouTube : ${YT_URL}`;
+    case '!tw':
+    case '!twitter':
+    case '!x':
+      return `Twitter : ${TWITTER_URL}`;
+    case '!help':
+      return `Commandes: !coucou, !discord, !yt, !twitter`;
+    case '!coucou':
+      return `Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer`;
+    default:
+      return null; // commande inconnue
+  }
+}
+
 // ===================== ROUTES =====================
 
-// Racine = healthcheck + gestion du redirect ?code=... (DLive t’a demandé redirect_uri = https://skrymi.com)
+// racine = healthcheck + gestion du redirect ?code=
 app.get('/', async (req, res) => {
   if (!req.query.code) {
-    return res.status(200).send('OK - DLive user-token (root redirect) [Authorization header = raw token]');
+    return res.status(200).send('OK - DLive user-token (root redirect) + commandes simples');
   }
   try {
     const code = req.query.code.toString();
 
-    // si tu utilises un "state" JSON encodé en base64url
+    // state optionnel encodé en base64url de type { m, t, r, s }
     let wanted = { m: DLIVE_MESSAGE, t: DLIVE_TARGET_USERNAME, r: 'Member', s: false };
     if (req.query.state) {
       try {
@@ -161,7 +186,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// Optionnel: démarreur d’OAuth (si tu veux éviter de coller l’URL à la main)
+// lancer l’OAuth à la main si besoin
 app.get('/auth/start', (req, res) => {
   const stateObj = {
     m: req.query.message || DLIVE_MESSAGE,
@@ -174,7 +199,7 @@ app.get('/auth/start', (req, res) => {
 
   const params = new URLSearchParams({
     client_id: DLIVE_CLIENT_ID,
-    redirect_uri: DLIVE_REDIRECT_URI,  // ex. https://skrymi.com
+    redirect_uri: DLIVE_REDIRECT_URI,
     response_type: 'code',
     scope: 'identity chat:write',
     state
@@ -183,7 +208,7 @@ app.get('/auth/start', (req, res) => {
   res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
 });
 
-// Envoi (après OAuth)
+// envoi direct
 app.get('/send', async (req, res) => {
   try {
     const msg = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
@@ -195,6 +220,24 @@ app.get('/send', async (req, res) => {
     res.status(200).send(`Message envoyé.<pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send('Erreur envoi: ' + e.message);
+  }
+});
+
+// commandes simples: /cmd?c=!discord&to=skrymi
+app.get('/cmd', async (req, res) => {
+  try {
+    const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
+    const cmd = (req.query.c || req.query.cmd || '').toString();
+    const reply = resolveCommand(cmd);
+    if (!reply) {
+      return res
+        .status(400)
+        .send(`Commande inconnue. Essaie !help — ou passe c=!discord | !yt | !twitter | !coucou`);
+    }
+    const result = await sendStreamchatMessage({ to, message: reply, role: 'Member', subscribing: false });
+    res.status(200).send(`Commande exécutée (${cmd}).<pre>${JSON.stringify(result, null, 2)}</pre>`);
+  } catch (e) {
+    res.status(500).send('Erreur commande: ' + e.message);
   }
 });
 
