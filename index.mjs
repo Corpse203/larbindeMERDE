@@ -1,4 +1,3 @@
-// index.mjs
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
@@ -6,19 +5,18 @@ import fetch from 'node-fetch';
 const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
-  DLIVE_REDIRECT_URI,                    // ⚠️ mettre https://skrymi.com
-  DLIVE_TARGET_DISPLAYNAME = 'skrymi',
-  DLIVE_MESSAGE = 'Hello depuis MrLarbin (user token)',
+  DLIVE_REDIRECT_URI,                  // ⚠️ ex: https://skrymi.com
+  DLIVE_TARGET_USERNAME = 'skrymi',    // ⚠️ "username" (pas displayname)
+  DLIVE_MESSAGE = 'Hello depuis MrLarbin',
   PORT = 3000,
 } = process.env;
 
 const app = express();
-
 const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL = 'https://graphigo.prd.dlive.tv/';
 
-// ===== Tokens en mémoire (persiste-les plus tard en DB si tu veux) =====
+// ===== Tokens en mémoire (persiste en DB si besoin) =====
 let userAccessToken = null;
 let userRefreshToken = null;
 let userTokenExpAt = 0; // timestamp ms
@@ -31,7 +29,7 @@ function basicAuthHeader() {
 async function exchangeCodeForToken(code) {
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
-    redirect_uri: DLIVE_REDIRECT_URI,   // doit correspondre EXACTEMENT à ce qui est enregistré chez DLive
+    redirect_uri: DLIVE_REDIRECT_URI,
     code
   });
 
@@ -47,8 +45,8 @@ async function exchangeCodeForToken(code) {
 
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Token exchange failed: ${resp.status} ${text}`);
-
   const json = JSON.parse(text);
+
   userAccessToken = json.access_token || null;
   userRefreshToken = json.refresh_token || null;
   const expiresIn = Number(json.expires_in || 3600);
@@ -61,7 +59,6 @@ async function exchangeCodeForToken(code) {
 async function refreshUserTokenIfNeeded() {
   const now = Date.now();
   if (userAccessToken && now < userTokenExpAt - 10_000) return userAccessToken;
-
   if (!userRefreshToken) throw new Error('No refresh_token; relance /auth/start');
 
   const form = new URLSearchParams({
@@ -91,12 +88,15 @@ async function refreshUserTokenIfNeeded() {
   return userAccessToken;
 }
 
+// ========= Appel GraphQL =========
+// ⚠️ Très important: DLive attend l'Authorization = <ACCESS_TOKEN> (sans "Bearer ")
+// Réf. leurs docs et exemples cURL. :contentReference[oaicite:2]{index=2} :contentReference[oaicite:3]{index=3}
 async function gqlUser(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL, {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${token}`,
+      'Authorization': token,              // <-- pas de "Bearer "
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -113,75 +113,59 @@ async function gqlUser(query, variables) {
   return data.data;
 }
 
-// ========= Mutation d’envoi (selon ton schéma: streamer, message, roomRole, subscribing) =========
+// ========= Mutation d’envoi (selon leurs docs) =========
+// Input: streamer (username), message, roomRole (Member/Moderator/Owner), subscribing (Boolean)
 async function sendStreamchatMessage({ to, message, role = 'Member', subscribing = false }) {
   const mutation = `
-    mutation SendChat($input: SendStreamchatMessageInput!) {
-      sendStreamchatMessage(input: $input) { __typename }
+    mutation SendMsg($input: SendStreamchatMessageInput!) {
+      sendStreamchatMessage(input: $input) { message { __typename } err { code message } }
     }
   `;
-  const input = {
-    streamer: to,
-    message,
-    roomRole: role,          // ENUM: Member | Moderator | Owner
-    subscribing             // Boolean!
-  };
+  // ⚠️ "streamer" = username (pas displayname). Docs l’indiquent. :contentReference[oaicite:4]{index=4}
+  const input = { streamer: to, message, roomRole: role, subscribing };
   const data = await gqlUser(mutation, { input });
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
 // ===================== ROUTES =====================
 
-// 1) RACINE = Healthcheck + Gestion du redirect ?code=... (comme demandé par DLive)
+// Racine = healthcheck + gestion du redirect ?code=... (DLive t’a demandé redirect_uri = https://skrymi.com)
 app.get('/', async (req, res) => {
-  // Si pas de code → healthcheck simple
   if (!req.query.code) {
-    return res.status(200).send('OK - user-token mode (root redirect)'); 
+    return res.status(200).send('OK - DLive user-token (root redirect) [Authorization header = raw token]');
   }
-
-  // Si on reçoit ?code=... → on termine l’OAuth ici
   try {
     const code = req.query.code.toString();
 
-    // On lit state si présent (sinon message/target par défaut)
-    let wanted = { m: DLIVE_MESSAGE, t: DLIVE_TARGET_DISPLAYNAME, r: 'Member', s: false };
+    // si tu utilises un "state" JSON encodé en base64url
+    let wanted = { m: DLIVE_MESSAGE, t: DLIVE_TARGET_USERNAME, r: 'Member', s: false };
     if (req.query.state) {
       try {
-        // Si tu utilises un state JSON encodé en base64url, décode-le ici.
-        // Par défaut, DLive renvoie juste la chaîne fournie. Ce bloc tente un parse "au cas où".
         const raw = req.query.state.toString();
         const maybe = Buffer.from(raw, 'base64url').toString('utf8');
         wanted = { ...wanted, ...JSON.parse(maybe) };
-      } catch {
-        // Pas grave si state n’est pas un JSON base64url
-      }
+      } catch {}
     }
 
     await exchangeCodeForToken(code);
     const result = await sendStreamchatMessage({
-      to: wanted.t,
-      message: wanted.m,
-      role: wanted.r || 'Member',
-      subscribing: wanted.s === true
+      to: wanted.t, message: wanted.m, role: wanted.r || 'Member', subscribing: !!wanted.s
     });
 
-    res
-      .status(200)
-      .send(
-        `OAuth OK via / (root). Jeton reçu et utilisé.<br>` +
-        `<h3>Message:</h3><pre>${JSON.stringify(result, null, 2)}</pre>`
-      );
+    res.status(200).send(
+      `OAuth OK (root).<br>` +
+      `<h3>Résultat envoi</h3><pre>${JSON.stringify(result, null, 2)}</pre>`
+    );
   } catch (e) {
     res.status(500).send('Erreur callback (root): ' + e.message);
   }
 });
 
-// 2) Démarrer l’OAuth (utile si tu veux un bouton “Login with DLive”)
+// Optionnel: démarreur d’OAuth (si tu veux éviter de coller l’URL à la main)
 app.get('/auth/start', (req, res) => {
-  // On peut encoder un petit JSON en base64url dans state pour transporter un message test
   const stateObj = {
     m: req.query.message || DLIVE_MESSAGE,
-    t: req.query.to || DLIVE_TARGET_DISPLAYNAME,
+    t: req.query.to || DLIVE_TARGET_USERNAME,
     r: 'Member',
     s: false,
     ts: Date.now()
@@ -190,7 +174,7 @@ app.get('/auth/start', (req, res) => {
 
   const params = new URLSearchParams({
     client_id: DLIVE_CLIENT_ID,
-    redirect_uri: DLIVE_REDIRECT_URI,        // ⚠️ https://skrymi.com (exact)
+    redirect_uri: DLIVE_REDIRECT_URI,  // ex. https://skrymi.com
     response_type: 'code',
     scope: 'identity chat:write',
     state
@@ -199,16 +183,16 @@ app.get('/auth/start', (req, res) => {
   res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
 });
 
-// 3) Envoi d’un message (après avoir fait l’OAuth une fois)
+// Envoi (après OAuth)
 app.get('/send', async (req, res) => {
   try {
-    const message = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
-    const to = (req.query.to || DLIVE_TARGET_DISPLAYNAME).toString();
+    const msg = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
+    const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
     const role = (req.query.role || 'Member').toString();   // Member/Moderator/Owner
     const subscribing = (req.query.subscribing === 'true' || req.query.subscribing === '1');
 
-    const result = await sendStreamchatMessage({ to, message, role, subscribing });
-    res.status(200).send(`Message envoyé (user token).<pre>${JSON.stringify(result, null, 2)}</pre>`);
+    const result = await sendStreamchatMessage({ to, message: msg, role, subscribing });
+    res.status(200).send(`Message envoyé.<pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send('Erreur envoi: ' + e.message);
   }
