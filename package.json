@@ -1,6 +1,6 @@
 {
   "name": "mrlarbin-dlive-user-token",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "engines": { "node": ">=18" },
   "scripts": {
@@ -10,6 +10,8 @@
   "dependencies": {
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "node-fetch": "^3.3.2"
+    "node-fetch": "^3.3.2",
+    "graphql-ws": "^5.14.2",
+    "ws": "^8.17.1"
   }
 }
