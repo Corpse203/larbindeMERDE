@@ -1,32 +1,30 @@
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
-import fs from 'fs';
-import path from 'path';
 import { createClient as createWsClient } from 'graphql-ws';
 
-// ====== ENV ======
+// ===== ENV =====
 const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
-  DLIVE_REDIRECT_URI,                    // ex: https://skrymi.com
-  DLIVE_TARGET_USERNAME = 'skrymi',      // username (pas display)
+  DLIVE_REDIRECT_URI,                // ex: https://skrymi.com
+  DLIVE_TARGET_USERNAME = 'skrymi',  // username (pas display)
   PORT = 10000,
 
-  // écoute auto
   ENABLE_CHAT_LISTENER = 'true',
   DLIVE_WS = 'wss://graphigostream.prd.dlive.tv/',
 
-  // panneau admin
+  // admin + liens
   ADMIN_PASSWORD = 'change-me',
-
-  // défauts commandes
   DISCORD_URL = 'https://discord.gg/ton-invite',
   YT_URL = 'https://youtube.com/@ton-chaine',
-  TWITTER_URL = 'https://twitter.com/toncompte'
+  TWITTER_URL = 'https://twitter.com/toncompte',
+
+  // PERSISTENCE via ENV
+  DLIVE_USER_REFRESH_TOKEN = '',     // 👈 on le colle ici côté Render
+  COMMANDS_JSON = ''                 // 👈 JSON des commandes (optionnel)
 } = process.env;
 
-// ====== CONSTS ======
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
@@ -35,16 +33,15 @@ const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL_HTTP = 'https://graphigo.prd.dlive.tv/';
 
-// ====== STORAGE (Disk Render) ======
-const DATA_DIR = '/data';
-const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
-const CMDS_FILE = path.join(DATA_DIR, 'commands.json');
+// ===== TOKENS EN MÉMOIRE (reconstruits via refresh_token d'env) =====
+let userAccessToken = null;
+let userRefreshToken = DLIVE_USER_REFRESH_TOKEN || null;
+let userTokenExpAt = 0;
 
-function ensureDataFiles() {
-  try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
-  if (!fs.existsSync(TOKENS_FILE)) fs.writeFileSync(TOKENS_FILE, JSON.stringify({}, null, 2));
-  if (!fs.existsSync(CMDS_FILE)) {
-    const defaults = {
+// ===== COMMANDES EN MÉMOIRE (charge depuis env au boot) =====
+function loadCommandsFromEnv() {
+  if (!COMMANDS_JSON) {
+    return {
       "!coucou": "Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer",
       "!discord": `Le discord est : ${DISCORD_URL}`,
       "!yt": `YouTube : ${YT_URL}`,
@@ -54,49 +51,18 @@ function ensureDataFiles() {
       "!x": `Twitter : ${TWITTER_URL}`,
       "!help": "Commandes: !coucou, !discord, !yt, !twitter"
     };
-    fs.writeFileSync(CMDS_FILE, JSON.stringify(defaults, null, 2));
   }
+  try { return JSON.parse(COMMANDS_JSON); } catch { return {}; }
 }
-ensureDataFiles();
+let COMMANDS = loadCommandsFromEnv(); // ⚠️ persistant jusqu’au redeploy
 
-// tokens en mémoire (chargés/sauvegardés)
-let userAccessToken = null;
-let userRefreshToken = null;
-let userTokenExpAt = 0; // ms
-
-function loadTokens() {
-  try {
-    const j = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
-    userAccessToken = j.access_token || null;
-    userRefreshToken = j.refresh_token || null;
-    userTokenExpAt = j.expires_at_ms || 0;
-  } catch {}
-}
-function saveTokens() {
-  const payload = {
-    access_token: userAccessToken,
-    refresh_token: userRefreshToken,
-    expires_at_ms: userTokenExpAt
-  };
-  fs.writeFileSync(TOKENS_FILE, JSON.stringify(payload, null, 2));
-}
-function loadCommands() {
-  try { return JSON.parse(fs.readFileSync(CMDS_FILE, 'utf8')); }
-  catch { return {}; }
-}
-function saveCommands(cmds) {
-  fs.writeFileSync(CMDS_FILE, JSON.stringify(cmds, null, 2));
-}
-
-// charge au boot
-loadTokens();
-
-// ====== OAUTH ======
+// ===== OAUTH =====
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
   return `Basic ${basic}`;
 }
 
+// Échange du code → tokens (affichés à l’écran pour que tu copies le refresh)
 async function exchangeCodeForToken(code) {
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -120,14 +86,15 @@ async function exchangeCodeForToken(code) {
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
   if (!userAccessToken) throw new Error(`No access_token in response: ${text}`);
-  saveTokens();
   return json;
 }
 
+// Refresh à partir du refresh_token (depuis env au boot)
 async function refreshUserTokenIfNeeded() {
   const now = Date.now();
   if (userAccessToken && now < userTokenExpAt - 10_000) return userAccessToken;
-  if (!userRefreshToken) throw new Error('No refresh_token; relance /auth/start');
+  if (!userRefreshToken) throw new Error('No refresh_token; colle-le dans DLIVE_USER_REFRESH_TOKEN puis restart.');
+
   const form = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: userRefreshToken
@@ -145,20 +112,19 @@ async function refreshUserTokenIfNeeded() {
   if (!resp.ok) throw new Error(`Refresh failed: ${resp.status} ${text}`);
   const json = JSON.parse(text);
   userAccessToken = json.access_token || userAccessToken;
-  if (json.refresh_token) userRefreshToken = json.refresh_token;
+  if (json.refresh_token) userRefreshToken = json.refresh_token; // si rotation
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
-  saveTokens();
   return userAccessToken;
 }
 
-// ====== GraphQL HTTP (Authorization = token brut, sans "Bearer") ======
+// ===== GraphQL HTTP (Authorization = token brut) =====
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token,
+      'Authorization': token, // IMPORTANT: sans "Bearer"
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -171,7 +137,7 @@ async function gqlHttp(query, variables) {
   return data.data;
 }
 
-// ====== Envoi chat ======
+// ===== Envoi chat =====
 async function sendStreamchatMessage({ to, message, role = 'Member', subscribing = false }) {
   const mutation = `
     mutation SendMsg($input: SendStreamchatMessageInput!) {
@@ -183,7 +149,8 @@ async function sendStreamchatMessage({ to, message, role = 'Member', subscribing
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
-// ====== Listener WebSocket ======
+// ===== Listener (WS) =====
+import { setTimeout as delay } from 'timers/promises';
 let wsClient = null;
 let wsRunning = false;
 
@@ -191,7 +158,7 @@ async function ensureWsClient() {
   const token = await refreshUserTokenIfNeeded();
   wsClient = createWsClient({
     url: DLIVE_WS,
-    connectionParams: { Authorization: token }, // token brut
+    connectionParams: { Authorization: token },
     keepAlive: 15000,
     retryAttempts: 100,
     retryWait: async function* () { while (true) yield 2000; }
@@ -223,11 +190,9 @@ async function pickChatSubscriptionField() {
 }
 
 function resolveCommand(cmdRaw = '') {
-  const cmds = loadCommands();
   const key = String(cmdRaw || '').trim();
   if (!key.startsWith('!')) return null;
-  // recherche directe, sinon en lower
-  return cmds[key] ?? cmds[key.toLowerCase()] ?? null;
+  return COMMANDS[key] ?? COMMANDS[key.toLowerCase()] ?? null;
 }
 
 async function startChatListener(streamerUsername) {
@@ -274,8 +239,18 @@ async function startChatListener(streamerUsername) {
           }
         } catch (e) { console.error('Listener error(next):', e.message); }
       },
-      error: (err) => { console.error('WS error:', err); wsRunning = false; },
-      complete: () => { console.log('WS complete'); wsRunning = false; }
+      error: async (err) => {
+        console.error('WS error:', err);
+        wsRunning = false;
+        await delay(2000);
+        if (ENABLE_CHAT_LISTENER === 'true') startChatListener(streamerUsername).catch(() => {});
+      },
+      complete: async () => {
+        console.log('WS complete');
+        wsRunning = false;
+        await delay(2000);
+        if (ENABLE_CHAT_LISTENER === 'true') startChatListener(streamerUsername).catch(() => {});
+      }
     }
   );
 
@@ -283,44 +258,50 @@ async function startChatListener(streamerUsername) {
 }
 
 async function stopChatListener() {
-  try { wsClient?.dispose(); } catch {}
+  try { wsClient?.dispose?.(); } catch {}
   wsClient = null;
   wsRunning = false;
   console.log('👂 Listener OFF');
 }
 
-// ====== ROUTES ======
+// ===== ROUTES =====
 
-// Root = healthcheck + gestion redirect ?code=
+// root = healthcheck + gestion redirect ?code=
 app.get('/', async (req, res) => {
-  if (!req.query.code) return res.status(200).send('OK - bot live (tokens on /data, auto listener, admin panel: /admin)');
+  if (!req.query.code) {
+    return res.status(200).send('OK - env-persist (refresh in env), listener auto, admin: /admin');
+  }
   try {
     const code = req.query.code.toString();
-    await exchangeCodeForToken(code);
-    // boot listener si activé
+    const tok = await exchangeCodeForToken(code);
+
+    // 👉 Montre le refresh pour que tu le copies dans Render env
+    const show = { ...tok, access_token: tok.access_token ? '***' : null };
+    res.status(200).send(
+      `<h3>OAuth OK</h3><pre>${JSON.stringify(show, null, 2)}</pre>` +
+      `<p><b>IMPORTANT :</b> copie <code>refresh_token</code> dans <code>DLIVE_USER_REFRESH_TOKEN</code> (Render → Environment), puis Restart.</p>`
+    );
+
+    // lance le listener maintenant
     if (ENABLE_CHAT_LISTENER === 'true') startChatListener(DLIVE_TARGET_USERNAME).catch(e => console.error('Listener error:', e.message));
-    const result = await sendStreamchatMessage({
-      to: DLIVE_TARGET_USERNAME, message: 'Connexion OAuth réussie ✅', role: 'Member', subscribing: false
-    });
-    res.status(200).send(`OAuth OK. <pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send('Erreur callback (root): ' + e.message);
   }
 });
 
-// Démarrer OAuth manuellement
+// démarrer OAuth à la main
 app.get('/auth/start', (req, res) => {
   const params = new URLSearchParams({
     client_id: DLIVE_CLIENT_ID,
     redirect_uri: DLIVE_REDIRECT_URI,
     response_type: 'code',
     scope: 'identity chat:write',
-    state: 'mrlarbin'  // tu peux ignorer
+    state: 'mrlarbin'
   });
   res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
 });
 
-// Envoi manuel
+// envoi manuel
 app.get('/send', async (req, res) => {
   try {
     const msg = (req.query.msg || 'Ping depuis /send').toString();
@@ -331,22 +312,26 @@ app.get('/send', async (req, res) => {
   }
 });
 
-// ====== ADMIN (simple, mot de passe) ======
+// ===== ADMIN simple =====
 function requireAdmin(req, res, next) {
   const pass = req.query.key || req.headers['x-admin-key'] || req.body?.key;
   if (pass === ADMIN_PASSWORD) return next();
   res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD');
 }
 
-// Page HTML simple
+// page admin
 app.get('/admin', requireAdmin, (req, res) => {
-  const cmds = loadCommands();
-  const rows = Object.entries(cmds).map(([k,v]) => `<tr><td><input name="k" value="${k}"/></td><td><input name="v" value="${v}"/></td></tr>`).join('');
+  const cmds = COMMANDS;
+  const rows = Object.entries(cmds).map(([k,v]) => `<tr><td><input name="k" value="${k}"/></td><td><input name="v" value="${(v+'').replace(/"/g,'&quot;')}"/></td></tr>`).join('');
   res.send(`
-    <h1>MrLarbin — Admin commandes</h1>
+    <h1>MrLarbin — Admin</h1>
+    <p><b>Attention :</b> sans disque, les changements ne survivent pas au redeploy. Clique "Exporter JSON" et colle-le ensuite dans <code>COMMANDS_JSON</code> (Render → Environment), puis Restart.</p>
     <form method="POST" action="/admin/commands?key=${encodeURIComponent(ADMIN_PASSWORD)}">
       <table>${rows}</table>
-      <button type="submit">Sauvegarder</button>
+      <button type="submit">Sauvegarder (mémoire)</button>
+    </form>
+    <form method="GET" action="/admin/export.json?key=${encodeURIComponent(ADMIN_PASSWORD)}">
+      <button type="submit">Exporter JSON (à coller dans COMMANDS_JSON)</button>
     </form>
     <hr/>
     <form method="POST" action="/listener/start?key=${encodeURIComponent(ADMIN_PASSWORD)}"><button>Start listener</button></form>
@@ -354,9 +339,8 @@ app.get('/admin', requireAdmin, (req, res) => {
   `);
 });
 
-// Sauvegarde via formulaire
+// maj en mémoire
 app.post('/admin/commands', requireAdmin, (req, res) => {
-  // req.body = { k:[...], v:[...] } quand plusieurs inputs
   const { k, v } = req.body;
   const map = {};
   if (Array.isArray(k) && Array.isArray(v)) {
@@ -364,22 +348,16 @@ app.post('/admin/commands', requireAdmin, (req, res) => {
   } else if (k && v !== undefined) {
     map[String(k).trim()] = String(v);
   }
-  // merge avec existants
-  const existing = loadCommands();
-  const merged = { ...existing, ...map };
-  saveCommands(merged);
+  COMMANDS = { ...COMMANDS, ...map };
   res.redirect(`/admin?key=${encodeURIComponent(ADMIN_PASSWORD)}`);
 });
 
-// API JSON: lister/maj commandes
-app.get('/admin/commands.json', requireAdmin, (_req, res) => res.json(loadCommands()));
-app.post('/admin/commands.json', requireAdmin, (req, res) => {
-  const cmds = req.body || {};
-  saveCommands(cmds);
-  res.json({ ok: true });
+// export JSON pour l'env
+app.get('/admin/export.json', requireAdmin, (_req, res) => {
+  res.type('json').send(COMMANDS);
 });
 
-// Start/Stop listener
+// start/stop listener
 app.post('/listener/start', requireAdmin, async (_req, res) => {
   try { await startChatListener(DLIVE_TARGET_USERNAME); res.send('Listener started'); }
   catch (e) { res.status(500).send(e.message); }
@@ -391,10 +369,9 @@ app.post('/listener/stop', requireAdmin, async (_req, res) => {
 
 app.listen(PORT, () => {
   console.log('Server started on port', PORT);
-  // si des tokens existent déjà, (ré)active le listener si demandé
   if (userRefreshToken && ENABLE_CHAT_LISTENER === 'true') {
     startChatListener(DLIVE_TARGET_USERNAME).catch(e => console.error('Listener error (boot):', e.message));
   } else if (ENABLE_CHAT_LISTENER === 'true') {
-    console.log('Listener attends OAuth: pas de refresh_token encore.');
+    console.log('Listener attend OAuth: pas de DLIVE_USER_REFRESH_TOKEN dans l\'env.');
   }
 });
