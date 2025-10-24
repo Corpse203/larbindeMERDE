@@ -1,38 +1,97 @@
-// index.mjs — DLive OAuth + envoi + écoute auto (Subscriptions) + commandes
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
+import fs from 'fs';
+import path from 'path';
 import { createClient as createWsClient } from 'graphql-ws';
 
+// ====== ENV ======
 const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
   DLIVE_REDIRECT_URI,                    // ex: https://skrymi.com
   DLIVE_TARGET_USERNAME = 'skrymi',      // username (pas display)
-  DLIVE_MESSAGE = 'Hello depuis MrLarbin',
-  PORT = 3000,
-
-  // commandes
-  DISCORD_URL = 'https://discord.gg/ton-invite',
-  YT_URL = 'https://youtube.com/@ton-chaine',
-  TWITTER_URL = 'https://twitter.com/toncompte',
+  PORT = 10000,
 
   // écoute auto
-  ENABLE_CHAT_LISTENER = 'true',         // "true" pour activer
-  DLIVE_WS = 'wss://graphigostream.prd.dlive.tv/' // endpoint WS (par défaut)
+  ENABLE_CHAT_LISTENER = 'true',
+  DLIVE_WS = 'wss://graphigostream.prd.dlive.tv/',
+
+  // panneau admin
+  ADMIN_PASSWORD = 'change-me',
+
+  // défauts commandes
+  DISCORD_URL = 'https://discord.gg/ton-invite',
+  YT_URL = 'https://youtube.com/@ton-chaine',
+  TWITTER_URL = 'https://twitter.com/toncompte'
 } = process.env;
 
+// ====== CONSTS ======
 const app = express();
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
 const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL_HTTP = 'https://graphigo.prd.dlive.tv/';
 
-// ===== Tokens en mémoire =====
+// ====== STORAGE (Disk Render) ======
+const DATA_DIR = '/data';
+const TOKENS_FILE = path.join(DATA_DIR, 'tokens.json');
+const CMDS_FILE = path.join(DATA_DIR, 'commands.json');
+
+function ensureDataFiles() {
+  try { if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true }); } catch {}
+  if (!fs.existsSync(TOKENS_FILE)) fs.writeFileSync(TOKENS_FILE, JSON.stringify({}, null, 2));
+  if (!fs.existsSync(CMDS_FILE)) {
+    const defaults = {
+      "!coucou": "Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer",
+      "!discord": `Le discord est : ${DISCORD_URL}`,
+      "!yt": `YouTube : ${YT_URL}`,
+      "!youtube": `YouTube : ${YT_URL}`,
+      "!tw": `Twitter : ${TWITTER_URL}`,
+      "!twitter": `Twitter : ${TWITTER_URL}`,
+      "!x": `Twitter : ${TWITTER_URL}`,
+      "!help": "Commandes: !coucou, !discord, !yt, !twitter"
+    };
+    fs.writeFileSync(CMDS_FILE, JSON.stringify(defaults, null, 2));
+  }
+}
+ensureDataFiles();
+
+// tokens en mémoire (chargés/sauvegardés)
 let userAccessToken = null;
 let userRefreshToken = null;
 let userTokenExpAt = 0; // ms
 
+function loadTokens() {
+  try {
+    const j = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+    userAccessToken = j.access_token || null;
+    userRefreshToken = j.refresh_token || null;
+    userTokenExpAt = j.expires_at_ms || 0;
+  } catch {}
+}
+function saveTokens() {
+  const payload = {
+    access_token: userAccessToken,
+    refresh_token: userRefreshToken,
+    expires_at_ms: userTokenExpAt
+  };
+  fs.writeFileSync(TOKENS_FILE, JSON.stringify(payload, null, 2));
+}
+function loadCommands() {
+  try { return JSON.parse(fs.readFileSync(CMDS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+function saveCommands(cmds) {
+  fs.writeFileSync(CMDS_FILE, JSON.stringify(cmds, null, 2));
+}
+
+// charge au boot
+loadTokens();
+
+// ====== OAUTH ======
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
   return `Basic ${basic}`;
@@ -44,7 +103,6 @@ async function exchangeCodeForToken(code) {
     redirect_uri: DLIVE_REDIRECT_URI,
     code
   });
-
   const resp = await fetch(OAUTH_TOKEN, {
     method: 'POST',
     headers: {
@@ -54,17 +112,15 @@ async function exchangeCodeForToken(code) {
     },
     body: form.toString()
   });
-
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Token exchange failed: ${resp.status} ${text}`);
   const json = JSON.parse(text);
-
   userAccessToken = json.access_token || null;
   userRefreshToken = json.refresh_token || null;
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
-
   if (!userAccessToken) throw new Error(`No access_token in response: ${text}`);
+  saveTokens();
   return json;
 }
 
@@ -72,12 +128,10 @@ async function refreshUserTokenIfNeeded() {
   const now = Date.now();
   if (userAccessToken && now < userTokenExpAt - 10_000) return userAccessToken;
   if (!userRefreshToken) throw new Error('No refresh_token; relance /auth/start');
-
   const form = new URLSearchParams({
     grant_type: 'refresh_token',
     refresh_token: userRefreshToken
   });
-
   const resp = await fetch(OAUTH_TOKEN, {
     method: 'POST',
     headers: {
@@ -87,41 +141,37 @@ async function refreshUserTokenIfNeeded() {
     },
     body: form.toString()
   });
-
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Refresh failed: ${resp.status} ${text}`);
-
   const json = JSON.parse(text);
   userAccessToken = json.access_token || userAccessToken;
   if (json.refresh_token) userRefreshToken = json.refresh_token;
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
-
+  saveTokens();
   return userAccessToken;
 }
 
-// ========= GraphQL HTTP (sans "Bearer") =========
+// ====== GraphQL HTTP (Authorization = token brut, sans "Bearer") ======
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token,  // IMPORTANT: pas "Bearer "
+      'Authorization': token,
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
     body: JSON.stringify({ query, variables })
   });
-
   const text = await resp.text();
   let data = {};
   try { data = JSON.parse(text); } catch {}
-
   if (!resp.ok || data.errors) throw new Error(`GraphQL error: ${resp.status} ${text}`);
   return data.data;
 }
 
-// ========= Envoi d’un message =========
+// ====== Envoi chat ======
 async function sendStreamchatMessage({ to, message, role = 'Member', subscribing = false }) {
   const mutation = `
     mutation SendMsg($input: SendStreamchatMessageInput!) {
@@ -133,115 +183,74 @@ async function sendStreamchatMessage({ to, message, role = 'Member', subscribing
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
-// ========= Commandes =========
-function resolveCommand(cmdRaw = '') {
-  const cmd = cmdRaw.trim().toLowerCase();
-  switch (cmd) {
-    case '!discord':
-      return `Le discord est : ${DISCORD_URL}`;
-    case '!yt':
-    case '!youtube':
-      return `YouTube : ${YT_URL}`;
-    case '!tw':
-    case '!twitter':
-    case '!x':
-      return `Twitter : ${TWITTER_URL}`;
-    case '!help':
-      return `Commandes: !coucou, !discord, !yt, !twitter`;
-    case '!coucou':
-      return `Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer`;
-    default:
-      return null;
-  }
+// ====== Listener WebSocket ======
+let wsClient = null;
+let wsRunning = false;
+
+async function ensureWsClient() {
+  const token = await refreshUserTokenIfNeeded();
+  wsClient = createWsClient({
+    url: DLIVE_WS,
+    connectionParams: { Authorization: token }, // token brut
+    keepAlive: 15000,
+    retryAttempts: 100,
+    retryWait: async function* () { while (true) yield 2000; }
+  });
+  return wsClient;
 }
 
-// ========= Introspection SUBSCRIPTION pour trouver le bon champ =========
 async function pickChatSubscriptionField() {
   const q = `
     query {
       __type(name: "Subscription") {
-        name
-        fields {
-          name
-          args { name type { kind name ofType { kind name ofType { kind name } } } }
-        }
+        fields { name args { name type { kind name ofType { kind name ofType { kind name } } } } }
       }
     }
   `;
   const d = await gqlHttp(q, {});
   const fields = d.__type?.fields || [];
-
-  // Cherche un champ qui ressemble à un flux de chat
-  // heuristique: nom contient "chat" et possède un arg String (ex: streamer/username/streamerName)
   for (const f of fields) {
     const lname = (f.name || '').toLowerCase();
     if (!lname.includes('chat')) continue;
-
-    // cherche arg textuel probable
-    const args = f.args || [];
-    for (const a of args) {
-      const t = a.type;
-      const leaf = (() => {
-        let x = t;
-        while (x && !x.name && x.ofType) x = x.ofType;
-        return x || t;
-      })();
-      if ((leaf?.kind === 'SCALAR' && leaf?.name === 'String')) {
-        // trouvé un champ plausible: retour nom + arg
+    for (const a of (f.args || [])) {
+      let t = a.type; while (t && !t.name && t.ofType) t = t.ofType;
+      if (t?.kind === 'SCALAR' && t?.name === 'String') {
         return { fieldName: f.name, argName: a.name };
       }
     }
   }
-  throw new Error('Aucun champ Subscription ressemblant au chat trouvé (ouvre /schema pour vérifier).');
+  throw new Error('No chat-like subscription field found.');
 }
 
-// ========= Client WebSocket (graphql-ws) =========
-let wsClient = null;
-let wsRunning = false;
-
-async function ensureWsClient() {
-  if (wsClient) return wsClient;
-  const token = await refreshUserTokenIfNeeded();
-  wsClient = createWsClient({
-    url: DLIVE_WS,
-    connectionParams: { Authorization: token }, // IMPORTANT: token brut
-    keepAlive: 15000,
-    retryAttempts: 100,
-    retryWait: async function* retry() {
-      while (true) {
-        yield 2000; // 2s backoff
-      }
-    }
-  });
-  return wsClient;
+function resolveCommand(cmdRaw = '') {
+  const cmds = loadCommands();
+  const key = String(cmdRaw || '').trim();
+  if (!key.startsWith('!')) return null;
+  // recherche directe, sinon en lower
+  return cmds[key] ?? cmds[key.toLowerCase()] ?? null;
 }
 
 async function startChatListener(streamerUsername) {
   if (wsRunning) return;
   wsRunning = true;
 
-  const { fieldName, argName } = await pickChatSubscriptionField(); // ex: fieldName="streamChatMessages", argName="streamer"
-
+  const { fieldName, argName } = await pickChatSubscriptionField();
   const subscriptionQuery = `
     subscription OnChat($${argName}: String!) {
       ${fieldName}(${argName}: $${argName}) {
         __typename
-        # heuristiques de champs courants:
         content
         message
         text
         body
-        # infos expéditeur (si dispo)
         sender { username displayname __typename }
-        user { username displayname __typename }
+        user   { username displayname __typename }
       }
     }
   `;
-
   const client = await ensureWsClient();
   const vars = { [argName]: streamerUsername };
 
-  // Petite fonction pour extraire le texte de l'event (selon champ dispo)
   function extractText(payload) {
     const d = payload?.data?.[fieldName];
     if (!d) return null;
@@ -254,146 +263,138 @@ async function startChatListener(streamerUsername) {
     {
       next: async (payload) => {
         try {
-          const msg = extractText(payload);
-          if (!msg) return;
-          const trimmed = String(msg).trim();
+          const txt = extractText(payload);
+          if (!txt) return;
+          const trimmed = String(txt).trim();
+          if (!trimmed.startsWith('!')) return;
 
-          // On ignore les messages du bot lui-même (si username disponible)
-          const sender =
-            payload?.data?.[fieldName]?.sender?.username ||
-            payload?.data?.[fieldName]?.user?.username ||
-            null;
-
-          if (sender && sender.toLowerCase() === streamerUsername.toLowerCase()) {
-            // si le streamer poste, on peut traiter aussi — à toi de voir
+          const reply = resolveCommand(trimmed);
+          if (reply) {
+            await sendStreamchatMessage({ to: streamerUsername, message: reply, role: 'Member', subscribing: false });
           }
-
-          // Si c'est une commande reconnue, réponds
-          if (trimmed.startsWith('!')) {
-            const reply = resolveCommand(trimmed);
-            if (reply) {
-              await sendStreamchatMessage({
-                to: streamerUsername,
-                message: reply,
-                role: 'Member',
-                subscribing: false
-              });
-              // console.log('Réponse envoyée pour', trimmed);
-            }
-          }
-        } catch (e) {
-          console.error('Erreur handler chat:', e.message);
-        }
+        } catch (e) { console.error('Listener error(next):', e.message); }
       },
-      error: (err) => {
-        console.error('WS subscription error:', err);
-      },
-      complete: () => {
-        console.log('WS subscription completed');
-        wsRunning = false;
-      },
+      error: (err) => { console.error('WS error:', err); wsRunning = false; },
+      complete: () => { console.log('WS complete'); wsRunning = false; }
     }
   );
 
-  console.log(`👂 Écoute du chat activée via ${fieldName}(${argName}:"${streamerUsername}")`);
+  console.log(`👂 Listener ON via ${fieldName}(${argName}:"${streamerUsername}")`);
 }
 
-// ===================== ROUTES =====================
+async function stopChatListener() {
+  try { wsClient?.dispose(); } catch {}
+  wsClient = null;
+  wsRunning = false;
+  console.log('👂 Listener OFF');
+}
 
-// racine = healthcheck + gestion du redirect ?code=
+// ====== ROUTES ======
+
+// Root = healthcheck + gestion redirect ?code=
 app.get('/', async (req, res) => {
-  if (!req.query.code) {
-    return res.status(200).send('OK - DLive user-token (root redirect) + commandes + listener');
-  }
+  if (!req.query.code) return res.status(200).send('OK - bot live (tokens on /data, auto listener, admin panel: /admin)');
   try {
     const code = req.query.code.toString();
-
-    // state optionnel encodé en base64url: { m, t, r, s }
-    let wanted = { m: DLIVE_MESSAGE, t: DLIVE_TARGET_USERNAME, r: 'Member', s: false };
-    if (req.query.state) {
-      try {
-        const raw = req.query.state.toString();
-        const maybe = Buffer.from(raw, 'base64url').toString('utf8');
-        wanted = { ...wanted, ...JSON.parse(maybe) };
-      } catch {}
-    }
-
     await exchangeCodeForToken(code);
+    // boot listener si activé
+    if (ENABLE_CHAT_LISTENER === 'true') startChatListener(DLIVE_TARGET_USERNAME).catch(e => console.error('Listener error:', e.message));
     const result = await sendStreamchatMessage({
-      to: wanted.t, message: wanted.m, role: wanted.r || 'Member', subscribing: !!wanted.s
+      to: DLIVE_TARGET_USERNAME, message: 'Connexion OAuth réussie ✅', role: 'Member', subscribing: false
     });
-
-    // (ré)active l’écoute si demandée
-    if (ENABLE_CHAT_LISTENER === 'true') {
-      startChatListener(DLIVE_TARGET_USERNAME).catch(e => console.error('Listener error:', e.message));
-    }
-
-    res.status(200).send(
-      `OAuth OK (root).<br>` +
-      `<h3>Résultat envoi</h3><pre>${JSON.stringify(result, null, 2)}</pre>`
-    );
+    res.status(200).send(`OAuth OK. <pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send('Erreur callback (root): ' + e.message);
   }
 });
 
-// lancer l’OAuth à la main si besoin
+// Démarrer OAuth manuellement
 app.get('/auth/start', (req, res) => {
-  const stateObj = {
-    m: req.query.message || DLIVE_MESSAGE,
-    t: req.query.to || DLIVE_TARGET_USERNAME,
-    r: 'Member',
-    s: false,
-    ts: Date.now()
-  };
-  const state = Buffer.from(JSON.stringify(stateObj)).toString('base64url');
-
   const params = new URLSearchParams({
     client_id: DLIVE_CLIENT_ID,
     redirect_uri: DLIVE_REDIRECT_URI,
     response_type: 'code',
     scope: 'identity chat:write',
-    state
+    state: 'mrlarbin'  // tu peux ignorer
   });
-
   res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
 });
 
-// envoi direct
+// Envoi manuel
 app.get('/send', async (req, res) => {
   try {
-    const msg = (req.query.msg || req.query.message || DLIVE_MESSAGE).toString();
-    const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
-    const role = (req.query.role || 'Member').toString();   // Member/Moderator/Owner
-    const subscribing = (req.query.subscribing === 'true' || req.query.subscribing === '1');
-
-    const result = await sendStreamchatMessage({ to, message: msg, role, subscribing });
+    const msg = (req.query.msg || 'Ping depuis /send').toString();
+    const result = await sendStreamchatMessage({ to: DLIVE_TARGET_USERNAME, message: msg, role: 'Member', subscribing: false });
     res.status(200).send(`Message envoyé.<pre>${JSON.stringify(result, null, 2)}</pre>`);
   } catch (e) {
     res.status(500).send('Erreur envoi: ' + e.message);
   }
 });
 
-// commandes manuelles: /cmd?c=!coucou
-app.get('/cmd', async (req, res) => {
-  try {
-    const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
-    const cmd = (req.query.c || req.query.cmd || '').toString();
-    const reply = resolveCommand(cmd);
-    if (!reply) {
-      return res.status(400).send(`Commande inconnue. Essaie !help — c=!coucou | !discord | !yt | !twitter`);
-    }
-    const result = await sendStreamchatMessage({ to, message: reply, role: 'Member', subscribing: false });
-    res.status(200).send(`Commande exécutée (${cmd}).<pre>${JSON.stringify(result, null, 2)}</pre>`);
-  } catch (e) {
-    res.status(500).send('Erreur commande: ' + e.message);
+// ====== ADMIN (simple, mot de passe) ======
+function requireAdmin(req, res, next) {
+  const pass = req.query.key || req.headers['x-admin-key'] || req.body?.key;
+  if (pass === ADMIN_PASSWORD) return next();
+  res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD');
+}
+
+// Page HTML simple
+app.get('/admin', requireAdmin, (req, res) => {
+  const cmds = loadCommands();
+  const rows = Object.entries(cmds).map(([k,v]) => `<tr><td><input name="k" value="${k}"/></td><td><input name="v" value="${v}"/></td></tr>`).join('');
+  res.send(`
+    <h1>MrLarbin — Admin commandes</h1>
+    <form method="POST" action="/admin/commands?key=${encodeURIComponent(ADMIN_PASSWORD)}">
+      <table>${rows}</table>
+      <button type="submit">Sauvegarder</button>
+    </form>
+    <hr/>
+    <form method="POST" action="/listener/start?key=${encodeURIComponent(ADMIN_PASSWORD)}"><button>Start listener</button></form>
+    <form method="POST" action="/listener/stop?key=${encodeURIComponent(ADMIN_PASSWORD)}"><button>Stop listener</button></form>
+  `);
+});
+
+// Sauvegarde via formulaire
+app.post('/admin/commands', requireAdmin, (req, res) => {
+  // req.body = { k:[...], v:[...] } quand plusieurs inputs
+  const { k, v } = req.body;
+  const map = {};
+  if (Array.isArray(k) && Array.isArray(v)) {
+    k.forEach((key, i) => { if (key && v[i] !== undefined) map[String(key).trim()] = String(v[i]); });
+  } else if (k && v !== undefined) {
+    map[String(k).trim()] = String(v);
   }
+  // merge avec existants
+  const existing = loadCommands();
+  const merged = { ...existing, ...map };
+  saveCommands(merged);
+  res.redirect(`/admin?key=${encodeURIComponent(ADMIN_PASSWORD)}`);
+});
+
+// API JSON: lister/maj commandes
+app.get('/admin/commands.json', requireAdmin, (_req, res) => res.json(loadCommands()));
+app.post('/admin/commands.json', requireAdmin, (req, res) => {
+  const cmds = req.body || {};
+  saveCommands(cmds);
+  res.json({ ok: true });
+});
+
+// Start/Stop listener
+app.post('/listener/start', requireAdmin, async (_req, res) => {
+  try { await startChatListener(DLIVE_TARGET_USERNAME); res.send('Listener started'); }
+  catch (e) { res.status(500).send(e.message); }
+});
+app.post('/listener/stop', requireAdmin, async (_req, res) => {
+  try { await stopChatListener(); res.send('Listener stopped'); }
+  catch (e) { res.status(500).send(e.message); }
 });
 
 app.listen(PORT, () => {
   console.log('Server started on port', PORT);
-  // démarrage listener si déjà autorisé et activé
-  if (ENABLE_CHAT_LISTENER === 'true') {
+  // si des tokens existent déjà, (ré)active le listener si demandé
+  if (userRefreshToken && ENABLE_CHAT_LISTENER === 'true') {
     startChatListener(DLIVE_TARGET_USERNAME).catch(e => console.error('Listener error (boot):', e.message));
+  } else if (ENABLE_CHAT_LISTENER === 'true') {
+    console.log('Listener attends OAuth: pas de refresh_token encore.');
   }
 });
