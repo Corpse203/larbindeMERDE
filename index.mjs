@@ -1,8 +1,8 @@
 import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
-import { createClient as createWsClient } from 'graphql-ws';
-import WebSocket from 'ws'; // ✅ nécessaire pour Node
+import WebSocket from 'ws';
+import { SubscriptionClient } from 'subscriptions-transport-ws';
 
 // === ENV ===
 const {
@@ -134,13 +134,13 @@ async function refreshUserTokenIfNeeded() {
   return userAccessToken;
 }
 
-// === GraphQL ===
+// === GraphQL HTTP ===
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token, // pas de Bearer
+      'Authorization': token, // IMPORTANT: sans "Bearer"
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -164,19 +164,22 @@ async function sendStreamchatMessage({ to, message, role = 'Member', subscribing
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
-// === WebSocket Listener ===
-let wsClient = null;
+// === WebSocket Listener (legacy 'graphql-ws' subprotocol) ===
+let subClient = null;
 let wsRunning = false;
 
 async function ensureWsClient() {
   const token = await refreshUserTokenIfNeeded();
-  wsClient = createWsClient({
-    url: DLIVE_WS,
-    webSocketImpl: WebSocket, // ✅ nécessaire pour Node
-    connectionParams: { Authorization: token },
-    keepAlive: 15000
-  });
-  return wsClient;
+  // SubscriptionClient utilise le protocole 'graphql-ws' (legacy) attendu par le serveur
+  subClient = new SubscriptionClient(
+    DLIVE_WS,
+    {
+      reconnect: true,
+      connectionParams: { Authorization: token }
+    },
+    WebSocket
+  );
+  return subClient;
 }
 
 async function pickChatSubscriptionField() {
@@ -206,27 +209,26 @@ async function startChatListener(streamerUsername) {
     }`;
 
   const client = await ensureWsClient();
-  client.subscribe(
-    { query, variables: { target: streamerUsername } },
-    {
-      next: async (payload) => {
-        try {
-          const d = payload?.data?.[fieldName];
-          const txt = d?.content || d?.message || d?.text || d?.body || '';
-          if (!txt.startsWith('!')) return;
-          const reply = resolveCommand(txt);
-          if (reply) await sendStreamchatMessage({ to: streamerUsername, message: reply });
-        } catch (e) { console.error('WS next:', e.message); }
-      },
-      error: (err) => { console.error('WS error:', err); wsRunning = false; },
-      complete: () => { console.log('WS complete'); wsRunning = false; }
-    }
-  );
+
+  const observable = client.request({ query, variables: { target: streamerUsername } });
+
+  const sub = observable.subscribe({
+    next: async (payload) => {
+      try {
+        const d = payload?.data?.[fieldName];
+        const txt = d?.content || d?.message || d?.text || d?.body || '';
+        if (!txt.startsWith('!')) return;
+        const reply = resolveCommand(txt);
+        if (reply) await sendStreamchatMessage({ to: streamerUsername, message: reply });
+      } catch (e) { console.error('WS next:', e.message); }
+    },
+    error: (err) => { console.error('WS error:', err); wsRunning = false; },
+    complete: () => { console.log('WS complete'); wsRunning = false; }
+  });
 
   console.log(`👂 Listener ON via ${fieldName}(${argName}:"${streamerUsername}")`);
 }
 
-// === ROUTES ===
 app.get('/', async (req, res) => {
   if (!req.query.code)
     return res.status(200).send('OK - ready (auth/start once)');
@@ -254,7 +256,7 @@ app.get('/send', async (req, res) => {
   } catch (e) { res.status(500).send(e.message); }
 });
 
-// === /cmd ===
+// /cmd manuel
 app.get('/cmd', async (req, res) => {
   try {
     const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
@@ -267,13 +269,12 @@ app.get('/cmd', async (req, res) => {
   } catch (e) { res.status(500).send(e.message); }
 });
 
-// === ADMIN ===
+// Admin ultra-simple
 function requireAdmin(req, res, next) {
   const pass = req.query.key || req.body?.key;
   if (pass === ADMIN_PASSWORD) return next();
   res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD');
 }
-
 app.get('/admin', requireAdmin, (req, res) => {
   const rows = Object.entries(COMMANDS).map(([k,v]) =>
     `<tr><td><input name="k" value="${k}"/></td><td><input name="v" value="${v}"/></td></tr>`
@@ -285,7 +286,6 @@ app.get('/admin', requireAdmin, (req, res) => {
     </form>
   `);
 });
-
 app.post('/admin/commands', requireAdmin, (req, res) => {
   const { k, v } = req.body;
   const map = {};
