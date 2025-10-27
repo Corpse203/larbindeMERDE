@@ -42,6 +42,7 @@ let userTokenExpAt = 0;
 
 // ========= Commandes =========
 let COMMANDS = {
+  '!skrymi': "bonjour oh grand maitre qui possède un étron sauvage d'une taille gigantesque, comment va tu oh vénérer maitre de toute chose",
   '!coucou': 'Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer',
   '!discord': `Le discord est : ${DISCORD_URL}`,
   '!yt': `YouTube : ${YT_URL}`,
