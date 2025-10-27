@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import fetch from 'node-fetch';
 import { createClient as createWsClient } from 'graphql-ws';
+import WebSocket from 'ws'; // ✅ nécessaire pour Node
 
 // === ENV ===
 const {
@@ -34,7 +35,7 @@ const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL_HTTP = 'https://graphigo.prd.dlive.tv/';
 
-// === Tokens en mémoire ===
+// === Tokens ===
 let userAccessToken = null;
 let userRefreshToken = DLIVE_USER_REFRESH_TOKEN || null;
 let userTokenExpAt = 0;
@@ -133,13 +134,13 @@ async function refreshUserTokenIfNeeded() {
   return userAccessToken;
 }
 
-// === GraphQL HTTP ===
+// === GraphQL ===
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token,
+      'Authorization': token, // pas de Bearer
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -163,18 +164,21 @@ async function sendStreamchatMessage({ to, message, role = 'Member', subscribing
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
-// === Listener WS ===
+// === WebSocket Listener ===
 let wsClient = null;
 let wsRunning = false;
+
 async function ensureWsClient() {
   const token = await refreshUserTokenIfNeeded();
   wsClient = createWsClient({
     url: DLIVE_WS,
+    webSocketImpl: WebSocket, // ✅ nécessaire pour Node
     connectionParams: { Authorization: token },
     keepAlive: 15000
   });
   return wsClient;
 }
+
 async function pickChatSubscriptionField() {
   if (CHAT_SUB_FIELD && CHAT_SUB_ARG) {
     console.log(`🔧 Subscription override: ${CHAT_SUB_FIELD}(${CHAT_SUB_ARG}:String!)`);
@@ -182,9 +186,11 @@ async function pickChatSubscriptionField() {
   }
   throw new Error('No chat-like subscription field found (define CHAT_SUB_FIELD and CHAT_SUB_ARG in env)');
 }
+
 async function startChatListener(streamerUsername) {
   if (wsRunning) return;
   wsRunning = true;
+
   const { fieldName, argName } = await pickChatSubscriptionField();
   const query = `
     subscription OnChat($target: String!) {
@@ -198,6 +204,7 @@ async function startChatListener(streamerUsername) {
         user { username displayname }
       }
     }`;
+
   const client = await ensureWsClient();
   client.subscribe(
     { query, variables: { target: streamerUsername } },
@@ -215,12 +222,14 @@ async function startChatListener(streamerUsername) {
       complete: () => { console.log('WS complete'); wsRunning = false; }
     }
   );
+
   console.log(`👂 Listener ON via ${fieldName}(${argName}:"${streamerUsername}")`);
 }
 
 // === ROUTES ===
 app.get('/', async (req, res) => {
-  if (!req.query.code) return res.status(200).send('OK - ready (auth/start once)');
+  if (!req.query.code)
+    return res.status(200).send('OK - ready (auth/start once)');
   try {
     const tok = await exchangeCodeForToken(req.query.code);
     res.status(200).send(`<pre>${JSON.stringify(tok, null, 2)}</pre><p>Copie le refresh_token dans DLIVE_USER_REFRESH_TOKEN et Restart.</p>`);
@@ -245,7 +254,7 @@ app.get('/send', async (req, res) => {
   } catch (e) { res.status(500).send(e.message); }
 });
 
-// === /cmd manuel ===
+// === /cmd ===
 app.get('/cmd', async (req, res) => {
   try {
     const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
