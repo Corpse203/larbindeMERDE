@@ -3,6 +3,7 @@ import express from 'express';
 import fetch from 'node-fetch';
 import WebSocket from 'ws';
 import axios from 'axios';
+import pg from 'pg';
 
 // ========= ENV =========
 const {
@@ -10,22 +11,32 @@ const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
   DLIVE_REDIRECT_URI,                // ex: https://skrymi.com
-  DLIVE_USER_REFRESH_TOKEN = '',     // colle ici (Render env) le refresh_token obtenu après /auth/start
 
   // Cibles
   DLIVE_TARGET_USERNAME = 'skrymi',  // username EXACT du streamer (pour envoyer)
-  DLIVE_CHANNEL = 'Skrymi',          // display name (comme dans l’URL DLive) pour écouter (sera résolu en username si besoin)
+  DLIVE_CHANNEL = 'Skrymi',          // display name (pour écouter, on résout en username si besoin)
 
   // Admin & conf
   ADMIN_PASSWORD = 'change-me',
   ENABLE_CHAT_LISTENER = 'true',
   PORT = 10000,
 
+  // DB pour persister les tokens
+  DATABASE_URL,                      // postgres://... (internal)
+
+  // (optionnel) fallback uniquement au premier boot si DB vide
+  DLIVE_USER_REFRESH_TOKEN = '',
+
   // Réponses par défaut
   DISCORD_URL = 'https://discord.gg/ton-invite',
   YT_URL = 'https://youtube.com/@ton-chaine',
   TWITTER_URL = 'https://twitter.com/toncompte'
 } = process.env;
+
+if (!DATABASE_URL) {
+  console.error('❌ DATABASE_URL manquant. Ajoute la chaîne Postgres dans les variables d’environnement.');
+  process.exit(1);
+}
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -35,37 +46,95 @@ const OAUTH_AUTHORIZE = 'https://dlive.tv/o/authorize';
 const OAUTH_TOKEN = 'https://dlive.tv/o/token';
 const GQL_HTTP = 'https://graphigo.prd.dlive.tv/';
 
+// ========= Postgres =========
+const { Pool } = pg;
+const pool = new Pool({ connectionString: DATABASE_URL });
+
+async function ensureSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS oauth_tokens (
+      id            text PRIMARY KEY,
+      access_token  text,
+      refresh_token text,
+      expires_at_ms bigint
+    );
+  `);
+  // clef unique pour notre bot
+  await pool.query(`
+    INSERT INTO oauth_tokens (id) VALUES ('dlive_user')
+    ON CONFLICT (id) DO NOTHING;
+  `);
+}
+
+async function loadTokensFromDB() {
+  const { rows } = await pool.query(
+    'SELECT access_token, refresh_token, expires_at_ms FROM oauth_tokens WHERE id=$1 LIMIT 1',
+    ['dlive_user']
+  );
+  return rows[0] || null;
+}
+
+async function saveTokensToDB({ access_token, refresh_token, expires_at_ms }) {
+  await pool.query(
+    `UPDATE oauth_tokens
+     SET access_token=$2, refresh_token=$3, expires_at_ms=$4
+     WHERE id=$1`,
+    ['dlive_user', access_token || null, refresh_token || null, Number(expires_at_ms) || 0]
+  );
+}
+
 // ========= TOKENS (mémoire) =========
 let userAccessToken = null;
-let userRefreshToken = DLIVE_USER_REFRESH_TOKEN || null;
+let userRefreshToken = null;
 let userTokenExpAt = 0;
 
 // ========= Commandes =========
 let COMMANDS = {
-  '!skrymi': "bonjour oh grand maitre qui possède un étron sauvage d'une taille gigantesque, comment va tu oh vénérer maitre de toute chose",
   '!coucou': 'Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer',
+  '!skrymi': "bonjour oh grand maitre qui possède un étron sauvage d'une taille gigantesque, comment va tu oh vénéré maitre de toute chose",
   '!discord': `Le discord est : ${DISCORD_URL}`,
   '!yt': `YouTube : ${YT_URL}`,
   '!youtube': `YouTube : ${YT_URL}`,
   '!tw': `Twitter : ${TWITTER_URL}`,
   '!twitter': `Twitter : ${TWITTER_URL}`,
   '!x': `Twitter : ${TWITTER_URL}`,
-  '!help': 'Commandes: !coucou, !discord, !yt, !twitter'
+  '!help': 'Commandes: !coucou, !skrymi, !discord, !yt, !twitter'
 };
 
-// ========= Helpers =========
 function resolveCommand(cmdRaw = '') {
   const key = String(cmdRaw || '').trim();
   if (!key.startsWith('!')) return null;
   return COMMANDS[key] ?? COMMANDS[key.toLowerCase()] ?? null;
 }
 
+// ========= Helpers OAuth =========
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
   return `Basic ${basic}`;
 }
 
-// ========= OAuth =========
+// charge tokens au boot (DB → mémoire), sinon seed avec env si fourni
+async function bootLoadTokens() {
+  await ensureSchema();
+  const row = await loadTokensFromDB();
+  if (row && (row.refresh_token || row.access_token)) {
+    userAccessToken = row.access_token || null;
+    userRefreshToken = row.refresh_token || null;
+    userTokenExpAt = Number(row.expires_at_ms || 0);
+    console.log('🔐 Tokens chargés depuis Postgres.');
+    return;
+  }
+  if (DLIVE_USER_REFRESH_TOKEN) {
+    userRefreshToken = DLIVE_USER_REFRESH_TOKEN;
+    userAccessToken = null;
+    userTokenExpAt = 0;
+    await saveTokensToDB({ access_token: null, refresh_token: userRefreshToken, expires_at_ms: 0 });
+    console.log('🪙 Seed refresh_token depuis env → sauvegardé en DB.');
+  } else {
+    console.log('ℹ️ Aucun token en DB. Lance /auth/start une fois pour initialiser.');
+  }
+}
+
 async function exchangeCodeForToken(code) {
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
@@ -86,17 +155,35 @@ async function exchangeCodeForToken(code) {
   const text = await resp.text();
   if (!resp.ok) throw new Error(`Token exchange failed: ${resp.status} ${text}`);
   const json = JSON.parse(text);
+
   userAccessToken = json.access_token || null;
   userRefreshToken = json.refresh_token || null;
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
+
+  // Sauvegarde en DB (persistance)
+  await saveTokensToDB({
+    access_token: userAccessToken,
+    refresh_token: userRefreshToken,
+    expires_at_ms: userTokenExpAt
+  });
+
   return json;
 }
 
 async function refreshUserTokenIfNeeded() {
   const now = Date.now();
+
+  // re-load si mémoire vide (ex: après crash) — DB = source de vérité
+  if (!userRefreshToken) {
+    const row = await loadTokensFromDB();
+    userAccessToken = row?.access_token || null;
+    userRefreshToken = row?.refresh_token || null;
+    userTokenExpAt = Number(row?.expires_at_ms || 0);
+  }
+
   if (userAccessToken && now < userTokenExpAt - 10_000) return userAccessToken;
-  if (!userRefreshToken) throw new Error('No refresh_token; colle-le dans DLIVE_USER_REFRESH_TOKEN puis Restart.');
+  if (!userRefreshToken) throw new Error('No refresh_token; lance /auth/start pour initialiser.');
 
   const form = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -116,23 +203,39 @@ async function refreshUserTokenIfNeeded() {
   const text = await resp.text();
 
   if (resp.status === 401 || /invalid_grant/i.test(text)) {
+    // invalide: on purge DB et mémoire → re-autorisation nécessaire
+    await saveTokensToDB({ access_token: null, refresh_token: null, expires_at_ms: 0 });
     userAccessToken = null;
     userRefreshToken = null;
     userTokenExpAt = 0;
-    throw new Error('Refresh failed: invalid_grant. Refaire /auth/start, puis copier le nouveau refresh_token dans DLIVE_USER_REFRESH_TOKEN (Render → Environment).');
+    throw new Error('Refresh failed: invalid_grant. Refaire /auth/start une fois.');
   }
+
   if (!resp.ok) throw new Error(`Refresh failed: ${resp.status} ${text}`);
 
   const json = JSON.parse(text);
   userAccessToken = json.access_token || userAccessToken;
-  if (json.refresh_token) userRefreshToken = json.refresh_token; // rotation éventuelle
+
+  // ⚠️ DLive peut ROTATE le refresh_token → on met à jour DB si fourni
+  if (json.refresh_token) {
+    userRefreshToken = json.refresh_token;
+  }
+
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
+
+  // persiste en DB
+  await saveTokensToDB({
+    access_token: userAccessToken,
+    refresh_token: userRefreshToken,
+    expires_at_ms: userTokenExpAt
+  });
+
   return userAccessToken;
 }
 
 // ========= GraphQL HTTP (send message) =========
-// Authorization = token BRUT (pas "Bearer")
+// Authorization = token BRUT (sans "Bearer")
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
@@ -162,7 +265,7 @@ async function sendStreamchatMessage({ to, message, role = 'Member', subscribing
   return { ok: true, inputUsed: input, result: data.sendStreamchatMessage };
 }
 
-// ========= RESOLVE username à partir du displayname (pour listener) =========
+// ========= Resolve username (pour listener) =========
 async function resolveStreamer(displayname) {
   const query = {
     operationName: 'LivestreamPage',
@@ -190,16 +293,14 @@ async function resolveStreamer(displayname) {
   return username;
 }
 
-// ========= Listener WS non-auth (ton approche) =========
+// ========= Listener WS non-auth (persisted query officielle) =========
 function subscribeChat(streamerUsername, onMessage) {
   const ws = new WebSocket('wss://graphigostream.prd.dlive.tv/', 'graphql-ws');
 
   ws.on('open', () => {
     console.log(`[dlive] WS ouvert pour ${streamerUsername}`);
-    // handshake
     ws.send(JSON.stringify({ type: 'connection_init', payload: {} }));
 
-    // start subscription via persisted query
     ws.send(JSON.stringify({
       id: '2',
       type: 'start',
@@ -207,7 +308,6 @@ function subscribeChat(streamerUsername, onMessage) {
         variables: { streamer: streamerUsername, viewer: '' },
         extensions: { persistedQuery: { version: 1, sha256Hash: '1246db4612a2a1acc520afcbd34684cdbcebad35bcfff29dcd7916a247722a7a' } },
         operationName: 'StreamMessageSubscription',
-        // garde la query pour compatibilité (serveur peut l’ignorer si persistedQuery valide)
         query:
           'subscription StreamMessageSubscription($streamer: String!, $viewer: String) {' +
           '  streamMessageReceived(streamer: $streamer, viewer: $viewer) {' +
@@ -241,13 +341,11 @@ function subscribeChat(streamerUsername, onMessage) {
     try {
       const data = JSON.parse(buf.toString());
       if (data.type === 'connection_ack' || data.type === 'ka') return;
-
       const msg = data?.payload?.data?.streamMessageReceived?.[0];
       if (!msg) return;
-
       onMessage(msg);
     } catch (e) {
-      console.error('[ws] parse error:', e.message || e);
+      console.error('[ws] parse error:', e?.message || String(e));
     }
   });
 
@@ -263,15 +361,13 @@ function subscribeChat(streamerUsername, onMessage) {
   return ws;
 }
 
-// ========= BOOT DU LISTENER =========
+// ========= BOOT LISTENER =========
 async function bootListener() {
   try {
-    // on préfère DLIVE_TARGET_USERNAME si déjà connu ; sinon on résout depuis le display name
     const streamer = DLIVE_TARGET_USERNAME || await resolveStreamer(DLIVE_CHANNEL);
     console.log(`[boot] écoute du chat sur username="${streamer}" (display="${DLIVE_CHANNEL}")`);
 
     subscribeChat(streamer, async (msg) => {
-      // on ne traite que les messages texte
       if (msg?.type !== 'Message' || msg?.__typename !== 'ChatText') return;
       const content = (msg.content || '').trim();
       if (!content.startsWith('!')) return;
@@ -280,7 +376,6 @@ async function bootListener() {
       if (!reply) return;
 
       try {
-        // ENVOI via mutation (nécessite OAuth user token valide)
         await sendStreamchatMessage({ to: streamer, message: reply, role: 'Member', subscribing: false });
       } catch (e) {
         console.error('[bot] envoi échoué:', e.message);
@@ -292,15 +387,8 @@ async function bootListener() {
 }
 
 // ========= ROUTES =========
-app.get('/', (req, res) => {
-  if (!req.query.code) return res.status(200).send('OK - listener + OAuth ready. Lance /auth/start une fois pour écrire dans le chat.');
-  exchangeCodeForToken(req.query.code.toString())
-    .then(tok => {
-      res
-        .status(200)
-        .send(`<pre>${JSON.stringify({ ...tok, access_token: '***' }, null, 2)}</pre><p>Copie le refresh_token dans DLIVE_USER_REFRESH_TOKEN (Render → Environment) puis Restart.</p>`);
-    })
-    .catch(e => res.status(500).send(String(e.message || e)));
+app.get('/', (_req, res) => {
+  res.status(200).send('OK - listener + OAuth persistant (Postgres). Lance /auth/start une fois si DB vide.');
 });
 
 app.get('/auth/start', (req, res) => {
@@ -323,7 +411,7 @@ app.get('/send', async (req, res) => {
   }
 });
 
-// /cmd manuel (utilise les mêmes réponses que le listener)
+// /cmd manuel
 app.get('/cmd', async (req, res) => {
   try {
     const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
@@ -338,7 +426,7 @@ app.get('/cmd', async (req, res) => {
   }
 });
 
-// Admin simple pour éditer les commandes (non persistant entre redeploys sans Disk/DB)
+// Admin simple
 function requireAdmin(req, res, next) {
   const pass = req.query.key || req.body?.key;
   if (pass === ADMIN_PASSWORD) return next();
@@ -354,7 +442,6 @@ app.get('/admin', requireAdmin, (req, res) => {
       <table>${rows}</table>
       <button type="submit">Sauvegarder (mémoire)</button>
     </form>
-    <p><small>Astuce: pour persister entre redeploys sans Disk, mets ces paires clé/valeur dans le code ou dans une env JSON si tu ajoutes ce support.</small></p>
   `);
 });
 app.post('/admin/commands', requireAdmin, (req, res) => {
@@ -367,9 +454,8 @@ app.post('/admin/commands', requireAdmin, (req, res) => {
 });
 
 // ========= START =========
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log('Server started on port', PORT);
-  if (ENABLE_CHAT_LISTENER === 'true') {
-    bootListener();
-  }
+  await bootLoadTokens();           // 🔐 charge/seed depuis DB/env
+  if (ENABLE_CHAT_LISTENER === 'true') bootListener();
 });
