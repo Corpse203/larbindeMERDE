@@ -9,23 +9,23 @@ import pg from 'pg';
 const {
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
-  DLIVE_REDIRECT_URI,                // DOIT être https://skrymi.com/oauth/callback (voir étapes)
-  DLIVE_TARGET_USERNAME = 'skrymi',  // username EXACT pour envoyer
-  DLIVE_CHANNEL = 'Skrymi',          // display name (pour écouter, on résout en username si besoin)
+  DLIVE_REDIRECT_URI,                // ICI: https://skrymi.com (racine)
+  DLIVE_TARGET_USERNAME = 'skrymi',  // username exact pour ENVOYER
+  DLIVE_CHANNEL = 'Skrymi',          // display name (pour ECOUTER, résolu en username)
   ADMIN_PASSWORD = 'change-me',
   ENABLE_CHAT_LISTENER = 'true',
   PORT = 10000,
   DATABASE_URL,                      // postgres://... (Render Postgres)
-  // Fallback facultatif si DB vide au 1er boot (seed)
+  // (optionnel) seed si DB vide au 1er boot
   DLIVE_USER_REFRESH_TOKEN = '',
-  // Liens par défaut pour les commandes
+  // Liens défaut pour commandes
   DISCORD_URL = 'https://discord.gg/ton-invite',
   YT_URL = 'https://youtube.com/@ton-chaine',
   TWITTER_URL = 'https://twitter.com/toncompte'
 } = process.env;
 
 if (!DATABASE_URL) {
-  console.error('❌ DATABASE_URL manquant. Ajoute la chaîne Postgres (Internal connection string) dans les variables d’environnement Render.');
+  console.error('❌ DATABASE_URL manquant (Render Postgres).');
   process.exit(1);
 }
 
@@ -97,7 +97,7 @@ function resolveCommand(cmdRaw = '') {
   return COMMANDS[key] ?? COMMANDS[key.toLowerCase()] ?? null;
 }
 
-// ========= OAuth Helpers =========
+// ========= OAuth helpers =========
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
   return `Basic ${basic}`;
@@ -114,7 +114,6 @@ async function bootLoadTokens() {
     return;
   }
   if (DLIVE_USER_REFRESH_TOKEN) {
-    // Seed depuis ENV si DB vide (premier boot)
     userRefreshToken = DLIVE_USER_REFRESH_TOKEN;
     userAccessToken = null;
     userTokenExpAt = 0;
@@ -128,7 +127,7 @@ async function bootLoadTokens() {
 async function exchangeCodeForToken(code) {
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
-    redirect_uri: DLIVE_REDIRECT_URI,
+    redirect_uri: DLIVE_REDIRECT_URI, // = https://skrymi.com
     code
   });
 
@@ -143,7 +142,10 @@ async function exchangeCodeForToken(code) {
   });
 
   const text = await resp.text();
-  if (!resp.ok) throw new Error(`Token exchange failed: ${resp.status} ${text}`);
+  if (!resp.ok) {
+    console.error('[oauth] exchange failed', resp.status, text);
+    throw new Error(`Token exchange failed: ${resp.status} ${text}`);
+  }
   const json = JSON.parse(text);
 
   userAccessToken = json.access_token || null;
@@ -163,7 +165,7 @@ async function exchangeCodeForToken(code) {
 async function refreshUserTokenIfNeeded() {
   const now = Date.now();
 
-  // Recharge mémoire depuis DB si nécessaire
+  // Recharge depuis DB si mémoire vide
   if (!userRefreshToken) {
     const row = await loadTokensFromDB();
     userAccessToken = row?.access_token || null;
@@ -172,7 +174,7 @@ async function refreshUserTokenIfNeeded() {
   }
 
   if (userAccessToken && now < userTokenExpAt - 10_000) return userAccessToken;
-  if (!userRefreshToken) throw new Error('No refresh_token; lance /auth/start pour initialiser.');
+  if (!userRefreshToken) throw new Error('No refresh_token; fais /auth/start pour initialiser.');
 
   const form = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -192,6 +194,7 @@ async function refreshUserTokenIfNeeded() {
   const text = await resp.text();
 
   if (resp.status === 401 || /invalid_grant/i.test(text)) {
+    console.error('[oauth] refresh invalid_grant', text);
     await saveTokensToDB({ access_token: null, refresh_token: null, expires_at_ms: 0 });
     userAccessToken = null;
     userRefreshToken = null;
@@ -199,16 +202,14 @@ async function refreshUserTokenIfNeeded() {
     throw new Error('Refresh failed: invalid_grant. Refaire /auth/start une fois.');
   }
 
-  if (!resp.ok) throw new Error(`Refresh failed: ${resp.status} ${text}`);
+  if (!resp.ok) {
+    console.error('[oauth] refresh failed', resp.status, text);
+    throw new Error(`Refresh failed: ${resp.status} ${text}`);
+  }
 
   const json = JSON.parse(text);
   userAccessToken = json.access_token || userAccessToken;
-
-  if (json.refresh_token) {
-    // rotation : on remplace en DB
-    userRefreshToken = json.refresh_token;
-  }
-
+  if (json.refresh_token) userRefreshToken = json.refresh_token; // rotation possible
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
 
@@ -221,13 +222,13 @@ async function refreshUserTokenIfNeeded() {
   return userAccessToken;
 }
 
-// ========= GraphQL HTTP (send message) =========
+// ========= GraphQL HTTP (envoi) =========
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token,           // IMPORTANT: token brut, sans "Bearer"
+      'Authorization': token, // token brut, sans "Bearer"
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -371,36 +372,44 @@ async function bootListener() {
 
 // ========= ROUTES =========
 
-// Health + info
-app.get('/', (_req, res) => {
-  res.status(200).send('OK - listener + OAuth persistant (Postgres). Lance /auth/start une fois si DB vide.');
+// HEALTH + échange de code sur la RACINE
+app.get('/', async (req, res) => {
+  // Si redirigé par DLive (Option A) → échange et PERSISTE
+  if (req.query.code) {
+    try {
+      console.log('[oauth] callback code =', String(req.query.code).slice(0, 8) + '...');
+      const tok = await exchangeCodeForToken(req.query.code.toString());
+      return res
+        .status(200)
+        .send(
+          `<h3>OAuth OK ✅</h3>` +
+          `<pre>${JSON.stringify({ ...tok, access_token: '***' }, null, 2)}</pre>` +
+          `<p>Tokens enregistrés en base. Tu peux fermer cette page.</p>`
+        );
+    } catch (e) {
+      console.error('[oauth] callback error:', e?.message || e);
+      return res.status(500).send('Erreur callback: ' + (e.message || e));
+    }
+  }
+  // Sinon: page info
+  res.status(200).send('OK - listener + OAuth persistant (Postgres). Va sur /auth/start pour initialiser si DB vide.');
 });
 
 // Démarrer OAuth
 app.get('/auth/start', (req, res) => {
-  const params = new URLSearchParams({
-    client_id: DLIVE_CLIENT_ID,
-    redirect_uri: DLIVE_REDIRECT_URI,
-    response_type: 'code',
-    scope: 'identity chat:write'
-  });
-  res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
-});
-
-// Callback OAuth PROPRE — PERSISTE les tokens en DB
-app.get('/oauth/callback', async (req, res) => {
   try {
-    if (!req.query.code) return res.status(400).send('Missing ?code');
-    const tok = await exchangeCodeForToken(req.query.code.toString());
-    res
-      .status(200)
-      .send(
-        `<h3>OAuth OK ✅</h3>` +
-        `<pre>${JSON.stringify({ ...tok, access_token: '***' }, null, 2)}</pre>` +
-        `<p>Tokens enregistrés en base. Tu peux fermer cette page.</p>`
-      );
+    const params = new URLSearchParams({
+      client_id: DLIVE_CLIENT_ID,
+      redirect_uri: DLIVE_REDIRECT_URI,  // = https://skrymi.com
+      response_type: 'code',
+      scope: 'identity chat:write',
+      state: 'skrymi_oauth'
+    });
+    const url = `https://dlive.tv/o/authorize?${params.toString()}`;
+    console.log('[oauth] auth/start ->', url);
+    res.redirect(url);
   } catch (e) {
-    res.status(500).send('Erreur callback: ' + (e.message || e));
+    res.status(500).send('Erreur /auth/start: ' + (e.message || e));
   }
 });
 
@@ -430,7 +439,7 @@ app.get('/cmd', async (req, res) => {
   }
 });
 
-// Admin simple (non persistant sans DB dédiée aux commandes)
+// Admin simple
 function requireAdmin(req, res, next) {
   const pass = req.query.key || req.body?.key;
   if (pass === ADMIN_PASSWORD) return next();
@@ -457,12 +466,14 @@ app.post('/admin/commands', requireAdmin, (req, res) => {
   res.redirect(`/admin?key=${encodeURIComponent(ADMIN_PASSWORD)}`);
 });
 
-// Debug utiles
-app.get('/debug/token-mem', (_req, res) => {
+// Debug utiles (facultatif)
+app.get('/debug/env', (_req, res) => {
   res.json({
-    has_access_token: !!userAccessToken,
-    has_refresh_token: !!userRefreshToken,
-    expires_at_ms: userTokenExpAt
+    DLIVE_CLIENT_ID,
+    DLIVE_REDIRECT_URI,
+    has_DATABASE_URL: !!process.env.DATABASE_URL,
+    target_username: process.env.DLIVE_TARGET_USERNAME,
+    channel_display: process.env.DLIVE_CHANNEL
   });
 });
 app.get('/debug/token-db', async (_req, res) => {
@@ -473,6 +484,15 @@ app.get('/debug/token-db', async (_req, res) => {
       has_refresh_token: !!row?.refresh_token,
       expires_at_ms: row?.expires_at_ms || 0
     });
+  } catch (e) {
+    res.status(500).send(String(e.message || e));
+  }
+});
+app.get('/admin/reset-tokens', async (_req, res) => {
+  try {
+    await saveTokensToDB({ access_token: null, refresh_token: null, expires_at_ms: 0 });
+    userAccessToken = null; userRefreshToken = null; userTokenExpAt = 0;
+    res.send('OK: tokens remis à zéro. Refaire /auth/start.');
   } catch (e) {
     res.status(500).send(String(e.message || e));
   }
