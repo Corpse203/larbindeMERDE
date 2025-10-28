@@ -7,34 +7,25 @@ import pg from 'pg';
 
 // ========= ENV =========
 const {
-  // OAuth pour ENVOYER des messages
   DLIVE_CLIENT_ID,
   DLIVE_CLIENT_SECRET,
-  DLIVE_REDIRECT_URI,                // ex: https://skrymi.com
-
-  // Cibles
-  DLIVE_TARGET_USERNAME = 'skrymi',  // username EXACT du streamer (pour envoyer)
+  DLIVE_REDIRECT_URI,                // DOIT être https://skrymi.com/oauth/callback (voir étapes)
+  DLIVE_TARGET_USERNAME = 'skrymi',  // username EXACT pour envoyer
   DLIVE_CHANNEL = 'Skrymi',          // display name (pour écouter, on résout en username si besoin)
-
-  // Admin & conf
   ADMIN_PASSWORD = 'change-me',
   ENABLE_CHAT_LISTENER = 'true',
   PORT = 10000,
-
-  // DB pour persister les tokens
-  DATABASE_URL,                      // postgres://... (internal)
-
-  // (optionnel) fallback uniquement au premier boot si DB vide
+  DATABASE_URL,                      // postgres://... (Render Postgres)
+  // Fallback facultatif si DB vide au 1er boot (seed)
   DLIVE_USER_REFRESH_TOKEN = '',
-
-  // Réponses par défaut
+  // Liens par défaut pour les commandes
   DISCORD_URL = 'https://discord.gg/ton-invite',
   YT_URL = 'https://youtube.com/@ton-chaine',
   TWITTER_URL = 'https://twitter.com/toncompte'
 } = process.env;
 
 if (!DATABASE_URL) {
-  console.error('❌ DATABASE_URL manquant. Ajoute la chaîne Postgres dans les variables d’environnement.');
+  console.error('❌ DATABASE_URL manquant. Ajoute la chaîne Postgres (Internal connection string) dans les variables d’environnement Render.');
   process.exit(1);
 }
 
@@ -59,7 +50,6 @@ async function ensureSchema() {
       expires_at_ms bigint
     );
   `);
-  // clef unique pour notre bot
   await pool.query(`
     INSERT INTO oauth_tokens (id) VALUES ('dlive_user')
     ON CONFLICT (id) DO NOTHING;
@@ -83,7 +73,7 @@ async function saveTokensToDB({ access_token, refresh_token, expires_at_ms }) {
   );
 }
 
-// ========= TOKENS (mémoire) =========
+// ========= Tokens (mémoire) =========
 let userAccessToken = null;
 let userRefreshToken = null;
 let userTokenExpAt = 0;
@@ -107,13 +97,12 @@ function resolveCommand(cmdRaw = '') {
   return COMMANDS[key] ?? COMMANDS[key.toLowerCase()] ?? null;
 }
 
-// ========= Helpers OAuth =========
+// ========= OAuth Helpers =========
 function basicAuthHeader() {
   const basic = Buffer.from(`${DLIVE_CLIENT_ID}:${DLIVE_CLIENT_SECRET}`).toString('base64');
   return `Basic ${basic}`;
 }
 
-// charge tokens au boot (DB → mémoire), sinon seed avec env si fourni
 async function bootLoadTokens() {
   await ensureSchema();
   const row = await loadTokensFromDB();
@@ -125,6 +114,7 @@ async function bootLoadTokens() {
     return;
   }
   if (DLIVE_USER_REFRESH_TOKEN) {
+    // Seed depuis ENV si DB vide (premier boot)
     userRefreshToken = DLIVE_USER_REFRESH_TOKEN;
     userAccessToken = null;
     userTokenExpAt = 0;
@@ -161,7 +151,6 @@ async function exchangeCodeForToken(code) {
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
 
-  // Sauvegarde en DB (persistance)
   await saveTokensToDB({
     access_token: userAccessToken,
     refresh_token: userRefreshToken,
@@ -174,7 +163,7 @@ async function exchangeCodeForToken(code) {
 async function refreshUserTokenIfNeeded() {
   const now = Date.now();
 
-  // re-load si mémoire vide (ex: après crash) — DB = source de vérité
+  // Recharge mémoire depuis DB si nécessaire
   if (!userRefreshToken) {
     const row = await loadTokensFromDB();
     userAccessToken = row?.access_token || null;
@@ -203,7 +192,6 @@ async function refreshUserTokenIfNeeded() {
   const text = await resp.text();
 
   if (resp.status === 401 || /invalid_grant/i.test(text)) {
-    // invalide: on purge DB et mémoire → re-autorisation nécessaire
     await saveTokensToDB({ access_token: null, refresh_token: null, expires_at_ms: 0 });
     userAccessToken = null;
     userRefreshToken = null;
@@ -216,15 +204,14 @@ async function refreshUserTokenIfNeeded() {
   const json = JSON.parse(text);
   userAccessToken = json.access_token || userAccessToken;
 
-  // ⚠️ DLive peut ROTATE le refresh_token → on met à jour DB si fourni
   if (json.refresh_token) {
+    // rotation : on remplace en DB
     userRefreshToken = json.refresh_token;
   }
 
   const expiresIn = Number(json.expires_in || 3600);
   userTokenExpAt = Date.now() + expiresIn * 1000;
 
-  // persiste en DB
   await saveTokensToDB({
     access_token: userAccessToken,
     refresh_token: userRefreshToken,
@@ -235,13 +222,12 @@ async function refreshUserTokenIfNeeded() {
 }
 
 // ========= GraphQL HTTP (send message) =========
-// Authorization = token BRUT (sans "Bearer")
 async function gqlHttp(query, variables) {
   const token = await refreshUserTokenIfNeeded();
   const resp = await fetch(GQL_HTTP, {
     method: 'POST',
     headers: {
-      'Authorization': token,
+      'Authorization': token,           // IMPORTANT: token brut, sans "Bearer"
       'Content-Type': 'application/json',
       'Accept': 'application/json'
     },
@@ -293,7 +279,7 @@ async function resolveStreamer(displayname) {
   return username;
 }
 
-// ========= Listener WS non-auth (persisted query officielle) =========
+// ========= Listener WS (non-auth, persisted query officielle) =========
 function subscribeChat(streamerUsername, onMessage) {
   const ws = new WebSocket('wss://graphigostream.prd.dlive.tv/', 'graphql-ws');
 
@@ -361,20 +347,17 @@ function subscribeChat(streamerUsername, onMessage) {
   return ws;
 }
 
-// ========= BOOT LISTENER =========
+// ========= Boot listener =========
 async function bootListener() {
   try {
     const streamer = DLIVE_TARGET_USERNAME || await resolveStreamer(DLIVE_CHANNEL);
     console.log(`[boot] écoute du chat sur username="${streamer}" (display="${DLIVE_CHANNEL}")`);
-
     subscribeChat(streamer, async (msg) => {
       if (msg?.type !== 'Message' || msg?.__typename !== 'ChatText') return;
       const content = (msg.content || '').trim();
       if (!content.startsWith('!')) return;
-
       const reply = resolveCommand(content);
       if (!reply) return;
-
       try {
         await sendStreamchatMessage({ to: streamer, message: reply, role: 'Member', subscribing: false });
       } catch (e) {
@@ -387,10 +370,13 @@ async function bootListener() {
 }
 
 // ========= ROUTES =========
+
+// Health + info
 app.get('/', (_req, res) => {
   res.status(200).send('OK - listener + OAuth persistant (Postgres). Lance /auth/start une fois si DB vide.');
 });
 
+// Démarrer OAuth
 app.get('/auth/start', (req, res) => {
   const params = new URLSearchParams({
     client_id: DLIVE_CLIENT_ID,
@@ -401,6 +387,24 @@ app.get('/auth/start', (req, res) => {
   res.redirect(`${OAUTH_AUTHORIZE}?${params.toString()}`);
 });
 
+// Callback OAuth PROPRE — PERSISTE les tokens en DB
+app.get('/oauth/callback', async (req, res) => {
+  try {
+    if (!req.query.code) return res.status(400).send('Missing ?code');
+    const tok = await exchangeCodeForToken(req.query.code.toString());
+    res
+      .status(200)
+      .send(
+        `<h3>OAuth OK ✅</h3>` +
+        `<pre>${JSON.stringify({ ...tok, access_token: '***' }, null, 2)}</pre>` +
+        `<p>Tokens enregistrés en base. Tu peux fermer cette page.</p>`
+      );
+  } catch (e) {
+    res.status(500).send('Erreur callback: ' + (e.message || e));
+  }
+});
+
+// Envoi manuel
 app.get('/send', async (req, res) => {
   try {
     const msg = (req.query.msg || 'ping').toString();
@@ -411,7 +415,7 @@ app.get('/send', async (req, res) => {
   }
 });
 
-// /cmd manuel
+// Commande manuelle
 app.get('/cmd', async (req, res) => {
   try {
     const to = (req.query.to || DLIVE_TARGET_USERNAME).toString();
@@ -426,7 +430,7 @@ app.get('/cmd', async (req, res) => {
   }
 });
 
-// Admin simple
+// Admin simple (non persistant sans DB dédiée aux commandes)
 function requireAdmin(req, res, next) {
   const pass = req.query.key || req.body?.key;
   if (pass === ADMIN_PASSWORD) return next();
@@ -453,9 +457,30 @@ app.post('/admin/commands', requireAdmin, (req, res) => {
   res.redirect(`/admin?key=${encodeURIComponent(ADMIN_PASSWORD)}`);
 });
 
+// Debug utiles
+app.get('/debug/token-mem', (_req, res) => {
+  res.json({
+    has_access_token: !!userAccessToken,
+    has_refresh_token: !!userRefreshToken,
+    expires_at_ms: userTokenExpAt
+  });
+});
+app.get('/debug/token-db', async (_req, res) => {
+  try {
+    const row = await loadTokensFromDB();
+    res.json({
+      has_access_token: !!row?.access_token,
+      has_refresh_token: !!row?.refresh_token,
+      expires_at_ms: row?.expires_at_ms || 0
+    });
+  } catch (e) {
+    res.status(500).send(String(e.message || e));
+  }
+});
+
 // ========= START =========
 app.listen(PORT, async () => {
   console.log('Server started on port', PORT);
-  await bootLoadTokens();           // 🔐 charge/seed depuis DB/env
+  await bootLoadTokens();           // charge/seed depuis DB/env
   if (ENABLE_CHAT_LISTENER === 'true') bootListener();
 });
