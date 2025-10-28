@@ -54,6 +54,13 @@ async function ensureSchema() {
     INSERT INTO oauth_tokens (id) VALUES ('dlive_user')
     ON CONFLICT (id) DO NOTHING;
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS commands (
+      k text PRIMARY KEY,
+      v text NOT NULL,
+      updated_at timestamptz DEFAULT now()
+    );
+  `);
 }
 
 async function loadTokensFromDB() {
@@ -73,12 +80,32 @@ async function saveTokensToDB({ access_token, refresh_token, expires_at_ms }) {
   );
 }
 
+// === Commands in DB ===
+async function loadCommandsFromDB() {
+  const { rows } = await pool.query(`SELECT k, v FROM commands ORDER BY k ASC`);
+  const map = {};
+  for (const r of rows) map[r.k] = r.v;
+  return map;
+}
+
+async function upsertCommandDB(k, v) {
+  await pool.query(
+    `INSERT INTO commands(k, v) VALUES($1, $2)
+     ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, updated_at = now()`,
+    [k, v]
+  );
+}
+
+async function deleteCommandDB(k) {
+  await pool.query(`DELETE FROM commands WHERE k = $1`, [k]);
+}
+
 // ========= Tokens (mémoire) =========
 let userAccessToken = null;
 let userRefreshToken = null;
 let userTokenExpAt = 0;
 
-// ========= Commandes =========
+// ========= Commandes (defaults) =========
 let COMMANDS = {
   '!coucou': 'Bonjour maitre supreme Browkse, le roi du dev DLive qui a réussi à me créer',
   '!skrymi': "bonjour oh grand maitre qui possède un étron sauvage d'une taille gigantesque, comment va tu oh vénéré maitre de toute chose",
@@ -103,8 +130,23 @@ function basicAuthHeader() {
   return `Basic ${basic}`;
 }
 
-async function bootLoadTokens() {
+async function bootLoadTokensAndCommands() {
   await ensureSchema();
+  // Commands
+  try {
+    const dbCmd = await loadCommandsFromDB();
+    if (Object.keys(dbCmd).length > 0) {
+      COMMANDS = dbCmd; // DB wins over defaults if present
+      console.log(`🧩 ${Object.keys(COMMANDS).length} commandes chargées depuis Postgres.`);
+    } else {
+      const entries = Object.entries(COMMANDS);
+      for (const [k, v] of entries) await upsertCommandDB(k, v);
+      console.log(`🧩 commandes par défaut seedées en DB (${entries.length}).`);
+    }
+  } catch (e) {
+    console.error('Commands load error:', e.message);
+  }
+  // Tokens
   const row = await loadTokensFromDB();
   if (row && (row.refresh_token || row.access_token)) {
     userAccessToken = row.access_token || null;
@@ -120,14 +162,14 @@ async function bootLoadTokens() {
     await saveTokensToDB({ access_token: null, refresh_token: userRefreshToken, expires_at_ms: 0 });
     console.log('🪙 Seed refresh_token depuis env → sauvegardé en DB.');
   } else {
-    console.log('ℹ️ Aucun token en DB. Lance /auth/start une fois pour initialiser.');
+    console.log('ℹ️ Aucun token en DB. Va sur /auth/start pour initialiser.');
   }
 }
 
 async function exchangeCodeForToken(code) {
   const form = new URLSearchParams({
     grant_type: 'authorization_code',
-    redirect_uri: DLIVE_REDIRECT_URI, // = https://skrymi.com
+    redirect_uri: DLIVE_REDIRECT_URI, // = https://skrymi.com (Option A)
     code
   });
 
@@ -196,9 +238,7 @@ async function refreshUserTokenIfNeeded() {
   if (resp.status === 401 || /invalid_grant/i.test(text)) {
     console.error('[oauth] refresh invalid_grant', text);
     await saveTokensToDB({ access_token: null, refresh_token: null, expires_at_ms: 0 });
-    userAccessToken = null;
-    userRefreshToken = null;
-    userTokenExpAt = 0;
+    userAccessToken = null; userRefreshToken = null; userTokenExpAt = 0;
     throw new Error('Refresh failed: invalid_grant. Refaire /auth/start une fois.');
   }
 
@@ -370,6 +410,13 @@ async function bootListener() {
   }
 }
 
+// ========= GUARD admin =========
+function requireAdmin(req, res, next) {
+  const pass = req.query.key || req.body?.key;
+  if (pass === ADMIN_PASSWORD) return next();
+  res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD');
+}
+
 // ========= ROUTES =========
 
 // HEALTH + échange de code sur la RACINE
@@ -439,31 +486,225 @@ app.get('/cmd', async (req, res) => {
   }
 });
 
-// Admin simple
-function requireAdmin(req, res, next) {
-  const pass = req.query.key || req.body?.key;
-  if (pass === ADMIN_PASSWORD) return next();
-  res.status(401).send('Unauthorized. Add ?key=YOUR_ADMIN_PASSWORD');
-}
-app.get('/admin', requireAdmin, (req, res) => {
-  const rows = Object.entries(COMMANDS)
-    .map(([k,v]) => `<tr><td><input name="k" value="${k}"/></td><td><input name="v" value="${(v+'').replace(/"/g,'&quot;')}"/></td></tr>`)
-    .join('');
-  res.send(`
-    <h2>Admin commandes</h2>
-    <form method="POST" action="/admin/commands?key=${encodeURIComponent(ADMIN_PASSWORD)}">
-      <table>${rows}</table>
-      <button type="submit">Sauvegarder (mémoire)</button>
-    </form>
-  `);
+// ---- Commands API (JSON) ----
+app.get('/api/commands', requireAdmin, async (_req, res) => {
+  try {
+    const map = await loadCommandsFromDB();
+    res.json({ ok: true, commands: map });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
 });
-app.post('/admin/commands', requireAdmin, (req, res) => {
-  const { k, v } = req.body;
-  const map = {};
-  if (Array.isArray(k) && Array.isArray(v)) k.forEach((key,i)=>{ if (key) map[String(k[i]).trim()] = String(v[i]); });
-  else if (k && v !== undefined) map[String(k).trim()] = String(v);
-  COMMANDS = { ...COMMANDS, ...map };
-  res.redirect(`/admin?key=${encodeURIComponent(ADMIN_PASSWORD)}`);
+
+app.post('/api/commands', requireAdmin, async (req, res) => {
+  try {
+    const k = String(req.body.k || '').trim();
+    const v = String(req.body.v ?? '');
+    if (!k.startsWith('!')) return res.status(400).json({ ok: false, error: 'La clé doit commencer par !' });
+    if (!k || v === '') return res.status(400).json({ ok: false, error: 'k et v requis' });
+    await upsertCommandDB(k, v);
+    COMMANDS[k] = v; // sync mémoire
+    res.json({ ok: true, k, v });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.delete('/api/commands/:k', requireAdmin, async (req, res) => {
+  try {
+    const k = decodeURIComponent(req.params.k || '');
+    if (!k.startsWith('!')) return res.status(400).json({ ok: false, error: 'Clé invalide' });
+    await deleteCommandDB(k);
+    delete COMMANDS[k]; // sync mémoire
+    res.json({ ok: true, k });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/commands/export', requireAdmin, async (_req, res) => {
+  const map = await loadCommandsFromDB();
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', 'attachment; filename=commands.json');
+  res.send(JSON.stringify(map, null, 2));
+});
+
+app.post('/api/commands/import', requireAdmin, async (req, res) => {
+  try {
+    const imported = req.body || {};
+    const entries = Object.entries(imported);
+    for (const [k, v] of entries) {
+      if (k.startsWith('!')) {
+        await upsertCommandDB(k, String(v));
+        COMMANDS[k] = String(v);
+      }
+    }
+    res.json({ ok: true, count: entries.length });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ---- Admin UI (jolie) ----
+app.get('/admin', requireAdmin, async (req, res) => {
+  const key = encodeURIComponent(req.query.key || '');
+  res.send(`
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Admin Commandes</title>
+<style>
+  :root{
+    --bg:#0b0f14;--bg2:#0d1117;--glass:rgba(19,25,33,.6);
+    --card:#0f1722;--muted:#94a3b8;--text:#e2e8f0;--acc:#22d3ee;--acc2:#38bdf8;--danger:#ef4444;--ok:#10b981;
+    --bord:#1f2937;--input:#0b1220;--input-b:#253042;--shadow:0 20px 60px rgba(0,0,0,.35);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:radial-gradient(1200px 600px at 10% -10%, rgba(34,211,238,.12), transparent 40%),radial-gradient(900px 600px at 90% 10%, rgba(56,189,248,.12), transparent 50%),linear-gradient(0deg,var(--bg),var(--bg2));color:var(--text);font-family:Inter,ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
+  header{padding:18px 20px;border-bottom:1px solid var(--bord);backdrop-filter:saturate(140%) blur(8px);background:linear-gradient(0deg,var(--glass),rgba(13,17,23,.7));position:sticky;top:0;z-index:20}
+  h1{margin:0;font-size:18px;letter-spacing:.2px}
+  main{max-width:1024px;margin:24px auto;padding:0 16px}
+  .card{background:linear-gradient(180deg,rgba(15,23,34,.9),rgba(11,17,26,.85));border:1px solid var(--bord);border-radius:16px;box-shadow:var(--shadow);overflow:hidden}
+  .head{display:flex;gap:16px;align-items:center;padding:16px;border-bottom:1px solid var(--bord)}
+  .muted{color:var(--muted);font-size:13px}
+  .row{display:flex;gap:12px;flex-wrap:wrap}
+  input[type=text], textarea{flex:1;min-width:220px;background:var(--input);border:1px solid var(--input-b);color:var(--text);border-radius:12px;padding:12px 14px;outline:none}
+  input[type=text]:focus, textarea:focus{border-color:var(--acc)}
+  textarea{width:100%;min-height:110px;resize:vertical}
+  button{background:linear-gradient(180deg,var(--acc),var(--acc2));color:#001018;border:none;border-radius:12px;padding:11px 16px;cursor:pointer;font-weight:600;box-shadow:0 6px 18px rgba(34,211,238,.25)}
+  button.secondary{background:#1f2937;color:#e5e7eb;border:1px solid var(--bord);box-shadow:none}
+  button.danger{background:linear-gradient(180deg,#f87171,#ef4444);color:#180000;box-shadow:0 6px 18px rgba(239,68,68,.25)}
+  button.ghost{background:transparent;border:1px solid var(--bord);color:var(--text)}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:12px;border-bottom:1px solid var(--bord);vertical-align:top}
+  tr:hover td{background:rgba(34,211,238,.03)}
+  .k{font-family:ui-monospace,Consolas,monospace}
+  .actions{display:flex;gap:8px;justify-content:flex-end}
+  .footer{display:flex;gap:10px;justify-content:space-between;align-items:center;padding:14px 16px;background:linear-gradient(0deg,var(--glass),rgba(13,17,23,.7));border-top:1px solid var(--bord)}
+  .pill{display:inline-flex;gap:6px;align-items:center;background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.35);padding:8px 12px;border-radius:999px;font-size:12px;color:#ccfbf1}
+  .tag{display:inline-block;background:#111827;border:1px solid #1f2937;border-radius:999px;padding:4px 8px;font-size:12px;color:#e5e7eb}
+  .hint{font-size:12px;color:#a3a3a3}
+</style>
+</head>
+<body>
+<header><h1>Admin Commandes</h1></header>
+<main>
+  <div class="card">
+    <div class="head">
+      <div>
+        <div class="muted">Gère les réponses <b>!...</b> (persistantes en DB). Tape la commande dans le chat pour tester.</div>
+        <div class="hint">Exemples: <span class="tag">!coucou</span> <span class="tag">!discord</span> <span class="tag">!yt</span></div>
+      </div>
+      <div style="flex:1"></div>
+      <a class="pill" href="/api/commands/export?key=${key}">Exporter JSON</a>
+      <label class="pill" style="cursor:pointer">
+        Importer JSON
+        <input type="file" id="importFile" accept="application/json" style="display:none">
+      </label>
+    </div>
+    <div style="padding:16px">
+      <div class="row" style="margin-bottom:8px">
+        <input id="newK" type="text" placeholder="!nouvelle-commande" />
+      </div>
+      <div class="row" style="margin-bottom:10px">
+        <textarea id="newV" placeholder="Réponse à envoyer dans le chat"></textarea>
+      </div>
+      <div class="row" style="justify-content:flex-end">
+        <button id="addBtn">Ajouter / Mettre à jour</button>
+      </div>
+    </div>
+    <div style="padding:0 16px 8px">
+      <table id="tbl"><thead>
+        <tr><th style="width:260px">Commande</th><th>Réponse</th><th style="width:200px"></th></tr>
+      </thead><tbody id="tbody"></tbody></table>
+    </div>
+    <div class="footer">
+      <div class="muted">Connecté en mode admin.</div>
+      <div class="actions">
+        <button class="secondary" id="reloadBtn">Recharger</button>
+        <button class="ghost" id="testBtn">Tester !coucou</button>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+const key = ${JSON.stringify(req.query.key || '')};
+
+async function fetchCommands(){
+  const res = await fetch('/api/commands?key=' + encodeURIComponent(key));
+  const j = await res.json();
+  if(!j.ok) throw new Error(j.error || 'fetch error');
+  return j.commands || {};
+}
+function renderRows(map){
+  const tbody = document.getElementById('tbody');
+  tbody.innerHTML = '';
+  Object.entries(map).sort((a,b)=>a[0].localeCompare(b[0])).forEach(([k,v])=>{
+    const tr = document.createElement('tr');
+    const tdK = document.createElement('td'); tdK.innerHTML = '<span class="k">'+k+'</span>';
+    const tdV = document.createElement('td'); tdV.textContent = v;
+    const tdA = document.createElement('td'); tdA.className = 'actions';
+
+    const editBtn = document.createElement('button');
+    editBtn.textContent = 'Éditer';
+    editBtn.onclick = () => { document.getElementById('newK').value = k; document.getElementById('newV').value = v; window.scrollTo({top:0,behavior:"smooth"}); };
+
+    const delBtn = document.createElement('button');
+    delBtn.className = 'danger';
+    delBtn.textContent = 'Supprimer';
+    delBtn.onclick = async () => {
+      if(!confirm('Supprimer '+k+' ?')) return;
+      const res = await fetch('/api/commands/'+encodeURIComponent(k)+'?key='+encodeURIComponent(key), { method:'DELETE' });
+      const j = await res.json();
+      if(!j.ok) return alert(j.error||'Erreur suppression');
+      loadAndRender();
+    };
+
+    tdA.append(editBtn, delBtn);
+    tr.append(tdK, tdV, tdA);
+    tbody.append(tr);
+  });
+}
+async function loadAndRender(){ try{ renderRows(await fetchCommands()); }catch(e){ alert(e.message); } }
+
+document.getElementById('addBtn').onclick = async () => {
+  const k = document.getElementById('newK').value.trim();
+  const v = document.getElementById('newV').value;
+  if(!k.startsWith('!')) return alert('La commande doit commencer par !');
+  const res = await fetch('/api/commands?key='+encodeURIComponent(key), {
+    method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({k,v})
+  });
+  const j = await res.json();
+  if(!j.ok) return alert(j.error||'Erreur sauvegarde');
+  document.getElementById('newK').value=''; document.getElementById('newV').value='';
+  loadAndRender();
+};
+
+document.getElementById('reloadBtn').onclick = loadAndRender;
+document.getElementById('testBtn').onclick = ()=>{ window.open('/cmd?c=!coucou','_blank'); };
+
+document.getElementById('importFile').onchange = async (ev)=>{
+  const file = ev.target.files?.[0]; if(!file) return;
+  try{
+    const txt = await file.text();
+    const json = JSON.parse(txt);
+    const res = await fetch('/api/commands/import?key='+encodeURIComponent(key), {
+      method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(json)
+    });
+    const j = await res.json();
+    if(!j.ok) throw new Error(j.error||'Import erreur');
+    alert('Import OK: '+(j.count||0)+' entrées');
+    loadAndRender();
+  }catch(e){ alert(e.message); }
+};
+
+loadAndRender();
+</script>
+</body>
+</html>
+  `);
 });
 
 // Debug utiles (facultatif)
@@ -501,6 +742,6 @@ app.get('/admin/reset-tokens', async (_req, res) => {
 // ========= START =========
 app.listen(PORT, async () => {
   console.log('Server started on port', PORT);
-  await bootLoadTokens();           // charge/seed depuis DB/env
+  await bootLoadTokensAndCommands(); // tokens + commandes
   if (ENABLE_CHAT_LISTENER === 'true') bootListener();
 });
